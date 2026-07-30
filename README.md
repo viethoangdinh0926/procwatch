@@ -61,7 +61,7 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
   ```bash
   <binary_path> -c <command> -i <telemetry_collection_interval> -l <app_label> -d <database_connection_string> -s <database_schema>
   ```
-  <database_schema> and <app_label> are used to identify the application in the database. They are used in the query of Grafana to filter the data.
+  `<database_schema>` and `<app_label>` are used to identify the application in the database. They are used in the query of Grafana to filter the data.
 
 ## Use Grafana to Visualize Data
 
@@ -75,10 +75,8 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
    sudo systemctl enable grafana-server
    ```
 3. Access Grafana at `http://<grafana_server_ip>:3000`.
-4. Log in with the username and password from `info.txt`.
-5. Add a Postgres data source using the connection string from `info.txt`.
-6. Create a dashboard and add panels for visualization.
-7. Configure each panel's query and transformation:
+4. Create a dashboard and add panels for visualization.
+5. Configure each panel's query and transformation:
 
    **Query — visualize CPU usage:**
    ```sql
