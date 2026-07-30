@@ -1,4 +1,5 @@
 # ProcWatch
+This is a simple application that monitors system processes and stores the data in a PostgreSQL database in TimescaleDB format. The data is then visualized using Grafana or other tools.
 
 ## Configure Postgres Server
 
@@ -48,14 +49,19 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
 
 ## Run Application
 
-- Install the Postgres client library:
+- Install the Postgres client library in the target environment:
   ```bash
   sudo apt install libpq-dev
   ```
+- Build the application for both x86_64 and aarch64:
+  ```bash
+  make all
+  ```
 - Run the application:
   ```bash
-  <binary_path> -c <command> -i <telemetry collection interval> -l <app label> -d <database connection string> -s <database schema>
+  <binary_path> -c <command> -i <telemetry_collection_interval> -l <app_label> -d <database_connection_string> -s <database_schema>
   ```
+  <database_schema> and <app_label> are used to identify the application in the database. They are used in the query of Grafana to filter the data.
 
 ## Use Grafana to Visualize Data
 
@@ -80,7 +86,7 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
      ts AS time,
      pid AS metric,
      cpu_pct AS pid
-   FROM procwatch.<table_name>
+   FROM <database_schema>.<table_name>
    WHERE $__timeFilter(ts)
    ORDER BY ts, metric;
    ```
@@ -91,7 +97,7 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
      ts AS time,
      pid AS metric,
      rss_kb AS pid
-   FROM procwatch.<table_name>
+   FROM <database_schema>.<table_name>
    WHERE $__timeFilter(ts)
    ORDER BY ts, metric;
    ```
