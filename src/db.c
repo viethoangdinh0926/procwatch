@@ -145,6 +145,35 @@ void db_ensure_tracker_objects(PGconn *conn, const char *schema) {
     }
     PQclear(res);
 
+    snprintf(sql, sizeof(sql),
+             "CREATE OR REPLACE FUNCTION %s.drop_inactive_tables()\n"
+             "RETURNS VOID AS $$\n"
+             "DECLARE\n"
+             "  rec RECORD;\n"
+             "BEGIN\n"
+             "  FOR rec IN\n"
+             "    SELECT schema_name, table_name\n"
+             "      FROM %s\n"
+             "     WHERE last_write < NOW() - INTERVAL '1 hour'\n"
+             "  LOOP\n"
+             "    EXECUTE format('DROP TABLE IF EXISTS %%I.%%I', rec.schema_name, rec.table_name);\n"
+             "    DELETE FROM %s\n"
+             "     WHERE schema_name = rec.schema_name\n"
+             "       AND table_name  = rec.table_name;\n"
+             "  END LOOP;\n"
+             "END;\n"
+             "$$ LANGUAGE plpgsql;",
+             esc_schema, qualified_tracker, qualified_tracker);
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "CREATE FUNCTION drop_inactive_tables failed: %s\n", PQerrorMessage(conn));
+        PQclear(res);
+        free(qualified_tracker);
+        PQfreemem(esc_schema);
+        exit(EXIT_FAILURE);
+    }
+    PQclear(res);
+
     PQfreemem(esc_schema);
     free(qualified_tracker);
 }
@@ -332,14 +361,13 @@ void db_prepare_insert(PGconn *conn, const char *schema, const char *table, cons
 }
 
 void db_insert_sample(PGconn *conn, const char *stmt_name,
-                      pid_t pid, double cpu_pct, long rss_kb)
+                      const char *pid, double cpu_pct, long rss_kb)
 {
-    char pid_buf[32], cpu_buf[64], rss_buf[64];
-    snprintf(pid_buf, sizeof(pid_buf), "%d", (int)pid);
+    char cpu_buf[64], rss_buf[64];
     snprintf(cpu_buf, sizeof(cpu_buf), "%.10g", cpu_pct);
     snprintf(rss_buf, sizeof(rss_buf), "%ld", rss_kb);
 
-    const char *vals[3] = { pid_buf, cpu_buf, rss_buf };
+    const char *vals[3] = { pid, cpu_buf, rss_buf };
     const int   lens[3] = { 0, 0, 0 };
     const int   fmts[3] = { 0, 0, 0 };
 
@@ -351,13 +379,26 @@ void db_insert_sample(PGconn *conn, const char *stmt_name,
 }
 
 
-void db_ensure_drop_inactive_job(PGconn *conn) {
+void db_ensure_drop_inactive_job(PGconn *conn, const char *schema) {
+    char job_name[128];
+    snprintf(job_name, sizeof(job_name), "drop_inactive_tables_every_5_minutes_%s", schema);
+    job_name[sizeof(job_name) - 1] = '\0';
+
+    char *lit_job = PQescapeLiteral(conn, job_name, strlen(job_name));
+    if (!lit_job) {
+        fprintf(stderr, "Failed to escape cron job name\n");
+        return;
+    }
+
+    char sql[1024];
+
     // Check if job exists
-    PGresult *res = PQexec(conn,
-        "SELECT jobid FROM cron.job WHERE jobname = 'drop_inactive_tables_every_5_minutes';");
+    snprintf(sql, sizeof(sql), "SELECT jobid FROM cron.job WHERE jobname = %s;", lit_job);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "cron job lookup failed: %s\n", PQerrorMessage(conn));
         PQclear(res);
+        PQfreemem(lit_job);
         return;
     }
 
@@ -365,25 +406,31 @@ void db_ensure_drop_inactive_job(PGconn *conn) {
     PQclear(res);
 
     if (!exists) {
-        res = PQexec(conn,
-            "SELECT cron.schedule("
-            "  'drop_inactive_tables_every_5_minutes',"
-            "  '*/5 * * * *',"
-            "  $$SELECT procwatch.drop_inactive_tables();$$"
-            ");");
+        char *qualified_fn = db_make_qualified(conn, schema, "drop_inactive_tables");
+        snprintf(sql, sizeof(sql),
+                 "SELECT cron.schedule("
+                 "  %s,"
+                 "  '*/5 * * * *',"
+                 "  $cron$SELECT %s();$cron$"
+                 ");",
+                 lit_job, qualified_fn);
+        free(qualified_fn);
+        res = PQexec(conn, sql);
         if (PQresultStatus(res) != PGRES_TUPLES_OK && PQresultStatus(res) != PGRES_COMMAND_OK) {
             fprintf(stderr, "cron.schedule failed: %s\n", PQerrorMessage(conn));
             PQclear(res);
+            PQfreemem(lit_job);
             return;
         }
         PQclear(res);
     }
 
     // Ensure nodename is NULL/empty to force Unix socket
-    res = PQexec(conn,
-        "UPDATE cron.job SET nodename = '' WHERE jobname = 'drop_inactive_tables_every_5_minutes';");
+    snprintf(sql, sizeof(sql), "UPDATE cron.job SET nodename = '' WHERE jobname = %s;", lit_job);
+    res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Failed to update cron job nodename: %s\n", PQerrorMessage(conn));
     }
     PQclear(res);
+    PQfreemem(lit_job);
 }

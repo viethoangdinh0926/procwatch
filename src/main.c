@@ -52,6 +52,13 @@ int main(int argc, char **argv) {
     pid_t child_pid = -1;
     int interval = 2;
     int samples = -1;
+    char pid_posfix[32] = "";
+    {
+        time_t now = time(NULL);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        strftime(pid_posfix, sizeof pid_posfix, "_%Y%m%d%H%M%S", &tm_buf);
+    }
     const char *conninfo = DEFAULT_CONNINFO;
     const char *schema   = DEFAULT_SCHEMA;
     const char *label    = NULL;
@@ -114,7 +121,7 @@ int main(int argc, char **argv) {
     // Connect to DB and ensure pg_cron + target table and job
     PGconn *db = db_connect_or_die(conninfo);
     db_ensure_table(db, schema, label);
-    db_ensure_drop_inactive_job(db);
+    db_ensure_drop_inactive_job(db, schema);
 
     printf("procwatch: tracking root pid=%d (label=%s, schema=%s)%s\n",
            pid, label, schema, command ? " (spawned command)" : "");
@@ -208,7 +215,9 @@ int main(int argc, char **argv) {
             if (delta_tot > 0) cpu_pct = (100.0 * (double)delta_proc / (double)delta_tot) * (double)g_ncpu;
             long rss_kb = snaps[i].status.vmrss_kb > 0 ? snaps[i].status.vmrss_kb : snaps[i].stat.rss * g_page_kb;
 
-            db_insert_sample(db, stmt_name, snaps[i].pid, cpu_pct, rss_kb);
+            char pid_full[64];
+            snprintf(pid_full, sizeof pid_full, "%d%s", (int)snaps[i].pid, pid_posfix);
+            db_insert_sample(db, stmt_name, pid_full, cpu_pct, rss_kb);
         }
 
         free(snaps);

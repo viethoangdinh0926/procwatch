@@ -107,7 +107,7 @@ GRANT ALL PRIVILEGES ON DATABASE procwatcherdb TO procwatcher;
 
 - Run the test application:
   ```bash
-  python3 test.py
+  <procwatch_binary_path> -c "python3 test.py" -i 5 -l "test_app" -d "<database_connection_string>" -s "<database_schema>"
   ```
 </content>
 </invoke>
