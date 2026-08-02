@@ -1,0 +1,37 @@
+# The agent payload image, equivalent to Dynatrace's oneagent-codemodules.
+#
+# This is not run as a workload. An init container mounts a shared emptyDir
+# and copies this tree into it, so the application container gets the
+# injector and the runtime agents without its own image being rebuilt.
+#
+# busybox rather than scratch because the init container's command is `cp`.
+#
+# Build with `make agent` first, then:
+#   docker build -f deploy/Dockerfile.codemodules -t procwatch/codemodules:latest .
+
+FROM busybox:1.36
+
+# Layout the injector expects. PROCWATCH_AGENT_DIR points at the root of this
+# tree, and the injector resolves java/javaagent.jar and python/ beneath it.
+#
+#   lib/libprocwatch_inject.so       glibc build
+#   lib-musl/libprocwatch_inject.so  musl build, for Alpine app images
+#   java/javaagent.jar
+#   python/sitecustomize.py + cp3XX/
+COPY build/agent/x86_64/lib/     /procwatch/agent/lib/
+COPY build/agent/x86_64/java/    /procwatch/agent/java/
+COPY build/agent/x86_64/python/  /procwatch/agent/python/
+COPY build/agent/x86_64-musl/lib/libprocwatch_inject.so /procwatch/agent/lib-musl/
+
+# The application container usually runs as a different, non-root user than
+# the init container that copied the files, so everything must be
+# world-readable and the shared objects world-executable.
+RUN chmod -R a+rX /procwatch
+
+# Sanity check at build time rather than at first pod start: a missing or
+# truncated injector is a silent no-op that is tedious to diagnose in a
+# cluster.
+RUN test -s /procwatch/agent/lib/libprocwatch_inject.so && \
+    test -s /procwatch/agent/lib-musl/libprocwatch_inject.so
+
+CMD ["/bin/sh", "-c", "cp -a /procwatch/agent/. /mnt/procwatch/ && echo 'procwatch agent installed'"]

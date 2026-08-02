@@ -1,0 +1,24 @@
+# procwatch-agentd: OTLP/HTTP receiver plus node-wide process metric
+# collector. Deployed as a DaemonSet.
+#
+# Build with `make agent-x86_64` first, then:
+#   docker build -f deploy/Dockerfile.agentd -t procwatch/agentd:latest .
+
+FROM debian:bookworm-slim
+
+# The bundle carries its own libpq and transitive dependencies in lib/, found
+# via the DT_RPATH of $ORIGIN/lib that scripts/build_agent.sh sets, so the
+# base image needs nothing beyond glibc.
+COPY build/agent/x86_64/procwatch-agentd /opt/procwatch/procwatch-agentd
+COPY build/agent/x86_64/lib/             /opt/procwatch/lib/
+
+RUN chmod 0755 /opt/procwatch/procwatch-agentd && \
+    /opt/procwatch/procwatch-agentd -h 2>&1 | head -1
+
+EXPOSE 4318
+
+# Runs as root because reading /proc/<pid>/environ for processes owned by
+# other users, which is how metrics get their service name, requires it.
+USER root
+
+ENTRYPOINT ["/opt/procwatch/procwatch-agentd"]

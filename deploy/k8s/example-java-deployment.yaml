@@ -1,0 +1,73 @@
+# Java workload with auto-instrumentation injected.
+#
+# Nothing about the application image changes. The init container drops the
+# agent tree into a shared emptyDir, and LD_PRELOAD makes the injector set
+# JAVA_TOOL_OPTIONS before the JVM reads it during JNI_CreateJavaVM.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-api
+  labels:
+    app.kubernetes.io/name: checkout-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: checkout-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: checkout-api
+    spec:
+      volumes:
+        - name: procwatch-agent
+          emptyDir: {}
+
+      initContainers:
+        - name: procwatch-install
+          image: procwatch/codemodules:latest
+          command: ["/bin/sh", "-c", "cp -a /procwatch/agent/. /mnt/procwatch/"]
+          volumeMounts:
+            - name: procwatch-agent
+              mountPath: /mnt/procwatch
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+
+      containers:
+        - name: app
+          image: eclipse-temurin:21-jre
+          command: ["java", "-jar", "/app/checkout.jar"]
+          volumeMounts:
+            - name: procwatch-agent
+              mountPath: /opt/procwatch/agent
+              readOnly: true
+          env:
+            # For an Alpine/musl base image use lib-musl/ instead. The glibc
+            # build cannot load under musl (it needs libc.so.6), and the
+            # loader ignores what it cannot load, so the pod would start
+            # normally and simply produce no traces.
+            - name: LD_PRELOAD
+              value: /opt/procwatch/agent/lib/libprocwatch_inject.so
+            - name: PROCWATCH_AGENT_DIR
+              value: /opt/procwatch/agent
+
+            # The agentd DaemonSet listens on the node's own address.
+            - name: PROCWATCH_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: PROCWATCH_ENDPOINT
+              value: http://$(PROCWATCH_NODE_IP):4318
+
+            - name: OTEL_SERVICE_NAME
+              value: checkout-api
+
+            # Pod identity, surfaced on both spans and process metrics.
+            - name: PROCWATCH_POD
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: k8s.pod.name=$(PROCWATCH_POD),k8s.node.name=$(PROCWATCH_NODE_IP)

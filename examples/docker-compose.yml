@@ -1,0 +1,105 @@
+# Local end-to-end stack: TimescaleDB, procwatch-agentd, and one workload per
+# supported runtime. Verifies the whole path without a Kubernetes cluster.
+#
+# Prerequisites:
+#   make runtimes && make agent-x86_64 && make agent-musl-x86_64
+#
+# Then:
+#   docker compose -f examples/docker-compose.yml up --build
+#
+# Java and Python produce spans in procwatch.otel_spans; all three produce
+# rows in procwatch.otel_procs.
+#
+# Schema version 2.4 rather than 3.x so that docker-compose v1 still honours
+# the service_healthy condition below; the v2 plugin reads it too.
+
+version: "2.4"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: procwatcherdb
+      POSTGRES_USER: procwatcher
+      POSTGRES_PASSWORD: procwatcherpw
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U procwatcher -d procwatcherdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  agentd:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.agentd
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      PROCWATCH_DB: "postgresql://procwatcher:procwatcherpw@timescaledb:5432/procwatcherdb"
+      PROCWATCH_SCHEMA: procwatch
+      PROCWATCH_LABEL: otel
+      PROCWATCH_INTERVAL: "10"
+    # The compose equivalent of the DaemonSet's hostPID: the collector needs
+    # to see the other containers' processes to produce metrics for them.
+    pid: host
+    privileged: false
+    cap_add:
+      - SYS_PTRACE
+    ports:
+      - "4318:4318"
+
+  # ---------------- Java: injected, produces spans ----------------
+  java-app:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    depends_on:
+      - agentd
+    volumes:
+      - ../build/agent/x86_64/lib:/opt/procwatch/agent/lib:ro
+      - ../build/agent/x86_64/java:/opt/procwatch/agent/java:ro
+      - ../build/agent/x86_64/python:/opt/procwatch/agent/python:ro
+    environment:
+      LD_PRELOAD: /opt/procwatch/agent/lib/libprocwatch_inject.so
+      PROCWATCH_AGENT_DIR: /opt/procwatch/agent
+      PROCWATCH_ENDPOINT: http://agentd:4318
+      PROCWATCH_INJECT_DEBUG: "1"
+      OTEL_SERVICE_NAME: checkout-api
+      # Flush quickly so the demo shows data within seconds.
+      OTEL_BSP_SCHEDULE_DELAY: "2000"
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"
+
+  # ---------------- Python: injected, produces spans ----------------
+  python-app:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    depends_on:
+      - agentd
+    volumes:
+      - ../build/agent/x86_64/lib:/opt/procwatch/agent/lib:ro
+      - ../build/agent/x86_64/java:/opt/procwatch/agent/java:ro
+      - ../build/agent/x86_64/python:/opt/procwatch/agent/python:ro
+    environment:
+      LD_PRELOAD: /opt/procwatch/agent/lib/libprocwatch_inject.so
+      PROCWATCH_AGENT_DIR: /opt/procwatch/agent
+      PROCWATCH_ENDPOINT: http://agentd:4318
+      PROCWATCH_INJECT_DEBUG: "1"
+      OTEL_SERVICE_NAME: payments
+      OTEL_BSP_SCHEDULE_DELAY: "2000"
+
+  # ---------------- Go: metrics only, no injection ----------------
+  go-app:
+    build:
+      context: .
+      dockerfile: go/Dockerfile
+    depends_on:
+      - agentd
+    # No LD_PRELOAD and no agent mount: a static Go binary has no PT_INTERP,
+    # so ld.so never runs and preloading would be a silent no-op. The agentd
+    # collector picks this container up through /proc instead.
+    environment:
+      PROCWATCH_SERVICE: inventory
