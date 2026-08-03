@@ -253,6 +253,28 @@ procwatch-agentd -P 4318 -s procwatch -d "<conn_str>"
 | `-T` | `PROCWATCH_INACTIVE_HOURS` | `720` | Drop tables with no writes for this many hours |
 | `-A` | `PROCWATCH_HOST_COLLECT` | off | Optional node-wide `/proc` scrape of labeled procs |
 
+### systemd
+
+```bash
+make agent-x86_64
+sudo useradd --system --home /var/lib/procwatch --shell /usr/sbin/nologin procwatch
+sudo mkdir -p /opt/procwatch /etc/procwatch /var/lib/procwatch/spill
+sudo cp build/agent/x86_64/procwatch-agentd /opt/procwatch/
+sudo cp -a build/agent/x86_64/lib /opt/procwatch/
+sudo cp deploy/systemd/agentd.env.example /etc/procwatch/agentd.env
+# edit PROCWATCH_DB (and optional -R/-T via env) in /etc/procwatch/agentd.env
+sudo chown -R procwatch:procwatch /var/lib/procwatch
+sudo chmod 0640 /etc/procwatch/agentd.env
+sudo cp deploy/systemd/procwatch-agentd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now procwatch-agentd
+sudo systemctl status procwatch-agentd
+```
+
+The unit reads `/etc/procwatch/agentd.env`, runs as user `procwatch`, and spills
+offline data under `/var/lib/procwatch/spill`. Logs go to the journal
+(`journalctl -u procwatch-agentd -f`).
+
 Application / wrap env:
 
 | Variable | Purpose |

@@ -1,0 +1,42 @@
+[Unit]
+Description=ProcWatch agentd (OTLP + process metrics)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=procwatch
+Group=procwatch
+
+# Copy deploy/systemd/agentd.env.example → /etc/procwatch/agentd.env and edit.
+EnvironmentFile=/etc/procwatch/agentd.env
+
+# Self-contained bundle: binary + lib/ (DT_RPATH $ORIGIN/lib).
+WorkingDirectory=/opt/procwatch
+ExecStart=/opt/procwatch/procwatch-agentd
+
+# Offline spill when the database is unreachable.
+StateDirectory=procwatch/spill
+StateDirectoryMode=0750
+# Prefer PROCWATCH_SPILL_DIR from the env file; this is a fallback.
+Environment=PROCWATCH_SPILL_DIR=/var/lib/procwatch/spill
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/procwatch
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
