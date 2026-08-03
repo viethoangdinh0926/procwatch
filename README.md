@@ -249,6 +249,8 @@ procwatch-agentd -P 4318 -s procwatch -d "<conn_str>"
 | `-i` | `PROCWATCH_INTERVAL` | `10` | Host-scrape interval when `-A` is set |
 | `-s` | `PROCWATCH_SCHEMA` | `procwatch` | Schema |
 | `-d` | `PROCWATCH_DB` | see `-h` | Connection string |
+| `-R` | `PROCWATCH_RETENTION_HOURS` | `168` | Timescale chunk retention (hours) |
+| `-T` | `PROCWATCH_INACTIVE_HOURS` | `720` | Drop tables with no writes for this many hours |
 | `-A` | `PROCWATCH_HOST_COLLECT` | off | Optional node-wide `/proc` scrape of labeled procs |
 
 Application / wrap env:
@@ -262,6 +264,7 @@ Application / wrap env:
 | `PROCWATCH_ENDPOINT` | Collector base URL (default `http://127.0.0.1:4318`) |
 | `PROCWATCH_SERVICE` | Service name on metrics (and OTEL service.name when set) |
 | `PROCWATCH_METRIC_INTERVAL` | Inject/wrap sample period, seconds (default 10) |
+| `PROCWATCH_SPILL_DIR` | Offline NDJSON spill directory (default `/var/tmp/procwatch`) |
 
 ## Kubernetes
 
@@ -278,10 +281,17 @@ string before applying.
 
 ## Schema
 
-Tables are created dynamically per label. Hypertables use the same 48-hour
-retention and `drop_inactive_tables` housekeeping as the classic `procwatch`
-metrics table. The `<schema>.<label>` table used by the standalone `procwatch`
-binary is untouched.
+Tables are created dynamically per label. Hypertables use chunk retention
+controlled by `-R` / `PROCWATCH_RETENTION_HOURS` (default **168** hours).
+`drop_inactive_tables` removes tables with no writes for `-T` /
+`PROCWATCH_INACTIVE_HOURS` (default **720** hours). Both apply to the classic
+`procwatch` binary as well (`-R` / `-T`). The `<schema>.<label>` table used by
+standalone `procwatch` is untouched.
+
+If TimescaleDB is unreachable, `procwatch` and `agentd` append records to an
+NDJSON spill file under `PROCWATCH_SPILL_DIR` (default `/var/tmp/procwatch`),
+retry the connection about every 5 seconds, and flush the spill in order once
+the database is back.
 
 `<schema>.<label>_spans`:
 

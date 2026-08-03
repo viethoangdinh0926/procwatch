@@ -57,8 +57,12 @@ static void hypertable_and_retention(PGconn *conn, const char *schema, const cha
              lit_schema, lit_table);
     exec_warn(conn, sql, "create_hypertable");
     snprintf(sql, sizeof sql,
-             "SELECT add_retention_policy(format('%%I.%%I', %s, %s)::regclass, INTERVAL '48 hours', if_not_exists => TRUE);",
+             "SELECT remove_retention_policy(format('%%I.%%I', %s, %s)::regclass, if_exists => TRUE);",
              lit_schema, lit_table);
+    exec_warn(conn, sql, "remove_retention_policy");
+    snprintf(sql, sizeof sql,
+             "SELECT add_retention_policy(format('%%I.%%I', %s, %s)::regclass, make_interval(hours => %d), if_not_exists => TRUE);",
+             lit_schema, lit_table, db_retention_hours());
     exec_warn(conn, sql, "add_retention_policy");
     PQfreemem(lit_schema);
     PQfreemem(lit_table);
@@ -231,6 +235,7 @@ static label_entry_t *find_label(const char *label) {
 }
 
 int db_ensure_label(PGconn *conn, const char *schema, const char *label) {
+    if (!conn || PQstatus(conn) != CONNECTION_OK) return -1;
     if (!validate_identifier(label) || !validate_identifier(schema)) return -1;
 
     label_entry_t *e = find_label(label);
@@ -258,6 +263,7 @@ int db_ensure_label(PGconn *conn, const char *schema, const char *label) {
 }
 
 int db_insert_span(PGconn *conn, const pw_span_t *span) {
+    if (!conn || PQstatus(conn) != CONNECTION_OK) return -1;
     label_entry_t *e = find_label(span->label);
     if (!e || !e->ready) {
         fprintf(stderr, "span insert: label %s not prepared\n", span->label);
@@ -292,6 +298,7 @@ int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label
                              const char *runtime, double cpu_pct, long rss_kb,
                              long threads) {
     (void)schema;
+    if (!conn || PQstatus(conn) != CONNECTION_OK) return -1;
     label_entry_t *e = find_label(label);
     if (!e || !e->ready) {
         fprintf(stderr, "metric insert: label %s not prepared\n", label);

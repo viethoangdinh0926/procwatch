@@ -25,6 +25,7 @@ AGENT_SRCS=(
     src/util.c
     src/proc_scan.c
     src/db.c
+    src/db_buffer.c
 )
 INJECT_SRCS=(
     src/inject/inject.c

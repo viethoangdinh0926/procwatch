@@ -7,13 +7,45 @@
 #include "../include/util.h"
 #include "../include/db.h"
 
-PGconn* db_connect_or_die(const char *conninfo) {
+static int g_retention_hours = PW_DEFAULT_RETENTION_HOURS;
+static int g_inactive_hours = PW_DEFAULT_INACTIVE_HOURS;
+
+void db_set_housekeeping(int retention_hours, int inactive_hours) {
+    if (retention_hours > 0) g_retention_hours = retention_hours;
+    if (inactive_hours > 0) g_inactive_hours = inactive_hours;
+}
+
+int db_retention_hours(void) { return g_retention_hours; }
+int db_inactive_hours(void) { return g_inactive_hours; }
+
+PGconn* db_connect(const char *conninfo) {
     PGconn *conn = PQconnectdb(conninfo);
+    if (!conn) return NULL;
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "PostgreSQL connection failed: %s\n", PQerrorMessage(conn));
-        exit(EXIT_FAILURE);
+        PQfinish(conn);
+        return NULL;
     }
     return conn;
+}
+
+PGconn* db_connect_or_die(const char *conninfo) {
+    PGconn *conn = db_connect(conninfo);
+    if (!conn) exit(EXIT_FAILURE);
+    return conn;
+}
+
+int db_reconnect(PGconn **conn, const char *conninfo) {
+    if (!conn) return 0;
+    if (*conn) {
+        if (PQstatus(*conn) == CONNECTION_OK) return 1;
+        PQreset(*conn);
+        if (PQstatus(*conn) == CONNECTION_OK) return 1;
+        PQfinish(*conn);
+        *conn = NULL;
+    }
+    *conn = db_connect(conninfo);
+    return (*conn && PQstatus(*conn) == CONNECTION_OK) ? 1 : 0;
 }
 
 void db_try_enable_timescaledb(PGconn *conn) {
@@ -154,7 +186,7 @@ void db_ensure_tracker_objects(PGconn *conn, const char *schema) {
              "  FOR rec IN\n"
              "    SELECT schema_name, table_name\n"
              "      FROM %s\n"
-             "     WHERE last_write < NOW() - INTERVAL '1 hour'\n"
+             "     WHERE last_write < NOW() - make_interval(hours => %d)\n"
              "  LOOP\n"
              "    EXECUTE format('DROP TABLE IF EXISTS %%I.%%I', rec.schema_name, rec.table_name);\n"
              "    DELETE FROM %s\n"
@@ -163,7 +195,7 @@ void db_ensure_tracker_objects(PGconn *conn, const char *schema) {
              "  END LOOP;\n"
              "END;\n"
              "$$ LANGUAGE plpgsql;",
-             esc_schema, qualified_tracker, qualified_tracker);
+             esc_schema, qualified_tracker, g_inactive_hours, qualified_tracker);
     res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         fprintf(stderr, "CREATE FUNCTION drop_inactive_tables failed: %s\n", PQerrorMessage(conn));
@@ -320,8 +352,17 @@ void db_ensure_table(PGconn *conn, const char *schema, const char *table) {
     PQclear(res);
 
     snprintf(sql, sizeof(sql),
-             "SELECT add_retention_policy(format('%%I.%%I', %s, %s)::regclass, INTERVAL '48 hours', if_not_exists => TRUE);",
+             "SELECT remove_retention_policy(format('%%I.%%I', %s, %s)::regclass, if_exists => TRUE);",
              lit_schema, lit_table);
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK &&
+        PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "remove_retention_policy warning: %s\n", PQerrorMessage(conn));
+    }
+    PQclear(res);
+    snprintf(sql, sizeof(sql),
+             "SELECT add_retention_policy(format('%%I.%%I', %s, %s)::regclass, make_interval(hours => %d), if_not_exists => TRUE);",
+             lit_schema, lit_table, g_retention_hours);
     res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK &&
         PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -360,9 +401,10 @@ void db_prepare_insert(PGconn *conn, const char *schema, const char *table, cons
     free(qualified);
 }
 
-void db_insert_sample(PGconn *conn, const char *stmt_name,
-                      const char *pid, double cpu_pct, long rss_kb)
+int db_insert_sample(PGconn *conn, const char *stmt_name,
+                     const char *pid, double cpu_pct, long rss_kb)
 {
+    if (!conn || PQstatus(conn) != CONNECTION_OK) return -1;
     char cpu_buf[64], rss_buf[64];
     snprintf(cpu_buf, sizeof(cpu_buf), "%.10g", cpu_pct);
     snprintf(rss_buf, sizeof(rss_buf), "%ld", rss_kb);
@@ -372,10 +414,10 @@ void db_insert_sample(PGconn *conn, const char *stmt_name,
     const int   fmts[3] = { 0, 0, 0 };
 
     PGresult *res = PQexecPrepared(conn, stmt_name, 3, vals, lens, fmts, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "Insert failed: %s\n", PQerrorMessage(conn));
-    }
+    int ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+    if (!ok) fprintf(stderr, "Insert failed: %s\n", PQerrorMessage(conn));
     PQclear(res);
+    return ok ? 0 : -1;
 }
 
 

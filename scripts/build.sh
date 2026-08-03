@@ -10,7 +10,7 @@ CC="$2"
 shift 2
 CFLAGS=("$@")
 
-SRCS=(src/main.c src/util.c src/proc_scan.c src/db.c)
+SRCS=(src/main.c src/util.c src/proc_scan.c src/db.c src/db_buffer.c)
 OUTDIR="build/$ARCH"
 
 apt-get update
