@@ -1,5 +1,5 @@
-# procwatch-agentd: OTLP/HTTP receiver plus node-wide process metric
-# collector. Deployed as a DaemonSet.
+# procwatch-agentd: OTLP/HTTP + /v1/procmetrics receiver.
+# Tables are created from each payload's label (no -l).
 #
 # Build with `make agent-x86_64` first, then:
 #   docker build -f deploy/Dockerfile.agentd -t procwatch/agentd:latest .
@@ -17,8 +17,6 @@ RUN chmod 0755 /opt/procwatch/procwatch-agentd && \
 
 EXPOSE 4318
 
-# Runs as root because reading /proc/<pid>/environ for processes owned by
-# other users, which is how metrics get their service name, requires it.
 USER root
 
 ENTRYPOINT ["/opt/procwatch/procwatch-agentd"]

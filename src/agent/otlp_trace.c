@@ -350,6 +350,7 @@ static void decode_kvlist(pb_reader_t *r, sb_t *sb, int depth) {
 typedef struct {
     char service_name[PW_SPAN_SERVICE_MAX];
     char scope_name[PW_SPAN_SCOPE_MAX];
+    char label[PW_SPAN_LABEL_MAX];
 } span_context_t;
 
 static int decode_span(pb_reader_t *r, const span_context_t *ctx,
@@ -360,6 +361,7 @@ static int decode_span(pb_reader_t *r, const span_context_t *ctx,
     span.status_code = status_code_name(0);
     snprintf(span.service_name, sizeof span.service_name, "%s", ctx->service_name);
     snprintf(span.scope_name, sizeof span.scope_name, "%s", ctx->scope_name);
+    snprintf(span.label, sizeof span.label, "%s", ctx->label);
 
     sb_t attrs;
     sb_init(&attrs, span.attributes_json, sizeof span.attributes_json);
@@ -536,6 +538,8 @@ static int decode_resource_spans(pb_reader_t *r, pw_span_sink_t sink,
                     if (have_value && strcmp(key, "service.name") == 0) {
                         any_value_as_string(value, ctx.service_name,
                                             sizeof ctx.service_name);
+                    } else if (have_value && strcmp(key, "procwatch.label") == 0) {
+                        any_value_as_string(value, ctx.label, sizeof ctx.label);
                     }
                 } else if (pb_skip(&res, rt.wire) != 1) {
                     break;

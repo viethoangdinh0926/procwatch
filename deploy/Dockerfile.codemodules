@@ -19,6 +19,7 @@ FROM busybox:1.36
 #   java/javaagent.jar
 #   python/sitecustomize.py + cp3XX/
 COPY build/agent/x86_64/lib/     /procwatch/agent/lib/
+COPY build/agent/x86_64/bin/     /procwatch/agent/bin/
 COPY build/agent/x86_64/java/    /procwatch/agent/java/
 COPY build/agent/x86_64/python/  /procwatch/agent/python/
 COPY build/agent/x86_64-musl/lib/libprocwatch_inject.so /procwatch/agent/lib-musl/
@@ -32,6 +33,7 @@ RUN chmod -R a+rX /procwatch
 # truncated injector is a silent no-op that is tedious to diagnose in a
 # cluster.
 RUN test -s /procwatch/agent/lib/libprocwatch_inject.so && \
-    test -s /procwatch/agent/lib-musl/libprocwatch_inject.so
+    test -s /procwatch/agent/lib-musl/libprocwatch_inject.so && \
+    test -s /procwatch/agent/bin/procwatch-wrap
 
 CMD ["/bin/sh", "-c", "cp -a /procwatch/agent/. /mnt/procwatch/ && echo 'procwatch agent installed'"]

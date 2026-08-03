@@ -21,19 +21,20 @@
 #include <unistd.h>
 
 #include "../../include/proc_scan.h"
+#include "../../include/util.h"
 #include "../../include/agent/collector.h"
 #include "../../include/agent/db_otlp.h"
 
 #define ENVIRON_READ_MAX 32768
 
-void collector_init(pw_collector_t *c, int require_service_env) {
+void collector_init(pw_collector_t *c, const char *schema) {
     memset(c, 0, sizeof *c);
     c->clk_tck = sysconf(_SC_CLK_TCK);
     if (c->clk_tck <= 0) c->clk_tck = 100;
     c->page_kb = sysconf(_SC_PAGESIZE) / 1024;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     c->ncpu = (ncpu > 0) ? ncpu : 1;
-    c->require_service_env = require_service_env;
+    if (schema) snprintf(c->schema, sizeof c->schema, "%s", schema);
 
     cpu_totals_t tot;
     if (parse_cpu_totals(&tot) == 0) c->prev_cpu_total = cpu_totals_sum(&tot);
@@ -227,6 +228,11 @@ int collector_tick(pw_collector_t *c, PGconn *conn) {
             snprintf(p->comm, sizeof p->comm, "%s", comm);
             p->runtime = classify_runtime(pid, comm);
 
+            if (read_environ_var(pid, "PROCWATCH_LABEL", p->label,
+                                 sizeof p->label) != 0) {
+                p->label[0] = '\0';
+            }
+
             if (read_environ_var(pid, "PROCWATCH_SERVICE", p->service,
                                  sizeof p->service) != 0) {
                 if (read_environ_var(pid, "OTEL_SERVICE_NAME", p->service,
@@ -255,7 +261,8 @@ int collector_tick(pw_collector_t *c, PGconn *conn) {
         // average rather than the interval's.
         if (is_new && prev_proc_time == 0) continue;
 
-        if (c->require_service_env && !p->service[0]) continue;
+        // Host scrape only records processes that carry a table label.
+        if (!p->label[0] || !validate_identifier(p->label)) continue;
 
         double cpu_pct = 0.0;
         if (delta_total > 0) {
@@ -270,10 +277,13 @@ int collector_tick(pw_collector_t *c, PGconn *conn) {
             if (status.threads > 0) threads = status.threads;
         }
 
+        if (db_ensure_label(conn, c->schema, p->label) != 0) continue;
+
         const char *service = p->service[0] ? p->service : p->comm;
-        if (db_insert_metric(conn, service, p->container_id, p->pod, (int)pid,
-                             p->comm, p->runtime ? p->runtime : "other",
-                             cpu_pct, rss_kb, threads) == 0) {
+        if (db_insert_metric_labeled(conn, c->schema, p->label, service,
+                                     p->container_id, p->pod, (int)pid,
+                                     p->comm, p->runtime ? p->runtime : "other",
+                                     cpu_pct, rss_kb, threads) == 0) {
             ++written;
             ++c->samples_written;
         }

@@ -35,6 +35,23 @@ void pw_apply_java(const char *agent_dir);
 void pw_apply_python(const char *agent_dir);
 void pw_apply_common(void);
 
+// Validated PROCWATCH_LABEL, or NULL if missing/invalid. Required before
+// OTEL bootstrap and before starting the metric thread.
+const char *pw_resolve_label(void);
+
+// Appends procwatch.label=<label> to OTEL_RESOURCE_ATTRIBUTES idempotently.
+void pw_attach_label_to_otel(const char *label);
+
+// Starts the metric push thread. Safe to call from __libc_start_main, not
+// from an ELF constructor (loader lock).
+void pw_metrics_thread_start(const char *runtime_hint);
+
+// True once the constructor decided this process should be instrumented.
+int pw_injection_armed(void);
+void pw_set_injection_armed(int armed);
+const char *pw_runtime_hint(void);
+void pw_set_runtime_hint(const char *hint);
+
 // Diagnostics go to stderr only when PROCWATCH_INJECT_DEBUG is set; an
 // injector that chatters on every process start is unusable.
 void pw_debug(const char *fmt, ...);

@@ -1,13 +1,9 @@
 // Minimal Go workload for the demo stack.
 //
-// This one is not injected and cannot be: the binary is built with
-// CGO_ENABLED=0, so it is statically linked, has no PT_INTERP, and ld.so
-// never runs for it. Setting LD_PRELOAD would be a silent no-op.
-//
-// It appears in procwatch.otel_procs anyway, because the agentd collector
-// walks /proc under hostPID and reads PROCWATCH_SERVICE from this process's
-// environment to label the rows. It burns a little CPU and allocates on a
-// timer so those metrics show movement rather than a flat line.
+// This binary is built with CGO_ENABLED=0 (static, no PT_INTERP), so
+// LD_PRELOAD is a silent no-op. Process metrics come from procwatch-wrap,
+// which forks this process as a child and POSTs /v1/procmetrics under
+// PROCWATCH_LABEL. No in-process inject thread is possible without ptrace.
 
 package main
 
@@ -21,7 +17,12 @@ import (
 	"time"
 )
 
-const port = 8080
+func listenPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return "8080"
+}
 
 type stockResponse struct {
 	SKU       string `json:"sku"`
@@ -64,6 +65,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("%s listening on %d (metrics only, no trace injection)", service, port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+	port := listenPort()
+	log.Printf("%s listening on %s (metrics only, no trace injection)", service, port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

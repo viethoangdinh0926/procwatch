@@ -14,7 +14,8 @@ typedef enum {
     PW_SIGNAL_UNKNOWN = 0,
     PW_SIGNAL_TRACES,
     PW_SIGNAL_METRICS,
-    PW_SIGNAL_LOGS
+    PW_SIGNAL_LOGS,
+    PW_SIGNAL_PROCMETRICS
 } pw_signal_t;
 
 typedef struct {

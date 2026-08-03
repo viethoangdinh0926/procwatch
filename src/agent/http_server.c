@@ -119,6 +119,7 @@ static pw_signal_t signal_for_path(const char *path) {
     if (strcmp(path, "/v1/traces") == 0) return PW_SIGNAL_TRACES;
     if (strcmp(path, "/v1/metrics") == 0) return PW_SIGNAL_METRICS;
     if (strcmp(path, "/v1/logs") == 0) return PW_SIGNAL_LOGS;
+    if (strcmp(path, "/v1/procmetrics") == 0) return PW_SIGNAL_PROCMETRICS;
     return PW_SIGNAL_UNKNOWN;
 }
 

@@ -1,5 +1,11 @@
-/* Export nothing. An accidentally exported getenv, malloc, or open would be
-   interposed process-wide in every process that loads this library. */
+/* Export only the interposed symbols. Everything else stays local so we
+   never accidentally replace getenv/malloc process-wide. */
 {
-    local: *;
+    global:
+        __libc_start_main;
+        execve;
+        execvpe;
+        execveat;
+    local:
+        *;
 };

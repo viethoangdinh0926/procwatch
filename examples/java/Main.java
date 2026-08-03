@@ -20,9 +20,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 public class Main {
-    private static final int PORT = 8080;
+    private static int port() {
+        String p = System.getenv("PORT");
+        if (p == null || p.isEmpty()) return 8080;
+        return Integer.parseInt(p);
+    }
 
     public static void main(String[] args) throws IOException {
+        final int PORT = port();
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
         server.createContext("/checkout", Main::handleCheckout);
         server.createContext("/health", exchange -> respond(exchange, 200, "ok"));
@@ -61,7 +66,7 @@ public class Main {
 
     private static void generateTraffic() {
         try {
-            URI uri = URI.create("http://localhost:" + PORT + "/checkout");
+            URI uri = URI.create("http://localhost:" + port() + "/checkout");
             HttpURLConnection conn = (HttpURLConnection) uri.toURL().openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(2000);

@@ -10,6 +10,7 @@ a working injection look broken. The app also calls itself on a timer, which
 the urllib instrumentation turns into client spans.
 """
 
+import os
 import random
 import threading
 import time
@@ -17,7 +18,7 @@ import urllib.request
 
 from flask import Flask, jsonify
 
-PORT = 8080
+PORT = int(os.environ.get("PORT", "8080"))
 
 app = Flask(__name__)
 

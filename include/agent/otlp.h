@@ -8,11 +8,13 @@
 #define PW_SPAN_SCOPE_MAX 256
 #define PW_SPAN_STATUS_MSG_MAX 512
 #define PW_SPAN_ATTRS_MAX 8192
+#define PW_SPAN_LABEL_MAX 100
 
 // One decoded OTLP span, flattened for insertion. Trace and span ids are
 // kept as lowercase hex because that is how every trace UI and every hand
 // written Grafana query expects to match them.
 typedef struct {
+    char label[PW_SPAN_LABEL_MAX];
     char trace_id[33];
     char span_id[17];
     char parent_span_id[17];

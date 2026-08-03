@@ -1,14 +1,11 @@
-// procwatch-agentd - OTLP receiver and process metric collector.
+// procwatch-agentd - OTLP receiver and process-metric ingest.
 //
-// Runs one event loop: poll() services the OTLP/HTTP receiver, and its
-// timeout doubles as the collector's tick. Single-threaded by design, so the
-// libpq connection needs no locking and spans and metrics are written from
-// the same place.
-//
-// The procwatch binary is unaffected by any of this; agentd is a separate
-// executable that only shares the /proc parsing and libpq helpers.
+// Tables are keyed by PROCWATCH_LABEL / procwatch.label on each payload.
+// Process metrics normally arrive via POST /v1/procmetrics from the inject
+// thread or procwatch-wrap; optional -A enables a hostPID /proc scrape.
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -29,7 +26,6 @@
 static const char *DEFAULT_CONNINFO =
     "postgresql://procwatcher:procwatcherpw@127.0.0.1:5433/procwatcherdb";
 static const char *DEFAULT_SCHEMA = "procwatch";
-static const char *DEFAULT_LABEL = "otel";
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -40,14 +36,105 @@ static void on_signal(int sig) {
 
 typedef struct {
     PGconn *db;
+    char schema[100];
     unsigned long long spans_written;
     unsigned long long spans_dropped;
+    unsigned long long metrics_written;
     unsigned long long payloads_traces;
+    unsigned long long payloads_procmetrics;
     unsigned long long payloads_other;
 } agent_state_t;
 
+// Minimal JSON string extractor: finds "key":"value" or "key":number.
+static int json_str(const char *body, size_t len, const char *key,
+                    char *out, size_t out_cap) {
+    char pat[128];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *end = body + len;
+    const char *p = body;
+    while (p < end) {
+        const char *hit = strstr(p, pat);
+        if (!hit || hit >= end) return -1;
+        const char *c = hit + strlen(pat);
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r')) ++c;
+        if (c >= end || *c != ':') { p = hit + 1; continue; }
+        ++c;
+        while (c < end && (*c == ' ' || *c == '\t')) ++c;
+        if (c >= end || *c != '"') { p = hit + 1; continue; }
+        ++c;
+        size_t i = 0;
+        while (c < end && *c != '"' && i + 1 < out_cap) {
+            if (*c == '\\' && c + 1 < end) { ++c; }
+            out[i++] = *c++;
+        }
+        out[i] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+static int json_num(const char *body, size_t len, const char *key, double *out) {
+    char pat[128];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *end = body + len;
+    const char *p = body;
+    while (p < end) {
+        const char *hit = strstr(p, pat);
+        if (!hit || hit >= end) return -1;
+        const char *c = hit + strlen(pat);
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r')) ++c;
+        if (c >= end || *c != ':') { p = hit + 1; continue; }
+        ++c;
+        while (c < end && (*c == ' ' || *c == '\t')) ++c;
+        char *endp = NULL;
+        *out = strtod(c, &endp);
+        if (endp == c) { p = hit + 1; continue; }
+        return 0;
+    }
+    return -1;
+}
+
+static int handle_procmetrics(agent_state_t *st, const uint8_t *body, size_t len) {
+    char label[100] = "", service[256] = "", comm[64] = "", runtime[32] = "other";
+    char pod[256] = "", container_id[80] = "";
+    double pid_d = 0, cpu = 0, rss = 0, threads = 0;
+
+    if (json_str((const char *)body, len, "label", label, sizeof label) != 0)
+        return -1;
+    if (!validate_identifier(label)) return -1;
+
+    json_str((const char *)body, len, "service", service, sizeof service);
+    json_str((const char *)body, len, "comm", comm, sizeof comm);
+    json_str((const char *)body, len, "runtime", runtime, sizeof runtime);
+    json_str((const char *)body, len, "pod", pod, sizeof pod);
+    json_str((const char *)body, len, "container_id", container_id, sizeof container_id);
+    json_num((const char *)body, len, "pid", &pid_d);
+    json_num((const char *)body, len, "cpu_pct", &cpu);
+    json_num((const char *)body, len, "rss_kb", &rss);
+    json_num((const char *)body, len, "threads", &threads);
+
+    if (db_ensure_label(st->db, st->schema, label) != 0) return -1;
+    if (!service[0]) snprintf(service, sizeof service, "%s", comm[0] ? comm : "unknown");
+
+    if (db_insert_metric_labeled(st->db, st->schema, label, service, container_id, pod,
+                                 (int)pid_d, comm, runtime, cpu, (long)rss,
+                                 (long)threads) == 0) {
+        ++st->metrics_written;
+        return 0;
+    }
+    return -1;
+}
+
 static int span_sink(const pw_span_t *span, void *user_data) {
     agent_state_t *st = (agent_state_t *)user_data;
+    if (!span->label[0] || !validate_identifier(span->label)) {
+        ++st->spans_dropped;
+        return 0; // skip unlabeled; keep decoding the rest
+    }
+    if (db_ensure_label(st->db, st->schema, span->label) != 0) {
+        ++st->spans_dropped;
+        return 0;
+    }
     if (db_insert_span(st->db, span) == 0) ++st->spans_written;
     else ++st->spans_dropped;
     return 0;
@@ -56,10 +143,12 @@ static int span_sink(const pw_span_t *span, void *user_data) {
 static int on_request(const pw_http_request_t *req, void *user_data) {
     agent_state_t *st = (agent_state_t *)user_data;
 
+    if (req->signal == PW_SIGNAL_PROCMETRICS) {
+        ++st->payloads_procmetrics;
+        return handle_procmetrics(st, req->body, req->body_len);
+    }
+
     if (req->signal != PW_SIGNAL_TRACES) {
-        // Metrics and logs are acknowledged but not stored. An SDK told to
-        // export all three signals would otherwise log connection errors
-        // every interval, which looks like a broken agent.
         ++st->payloads_other;
         return 0;
     }
@@ -75,17 +164,17 @@ static int on_request(const pw_http_request_t *req, void *user_data) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s [-b bind_addr] [-P port] [-i interval_sec] [-l label]\n"
-        "          [-d conn_str] [-s schema] [-A] [-M] [-h]\n"
+        "Usage: %s [-b bind_addr] [-P port] [-i interval_sec]\n"
+        "          [-d conn_str] [-s schema] [-A] [-h]\n"
         "  -b <addr>     Listen address (default 0.0.0.0, env PROCWATCH_BIND)\n"
         "  -P <port>     OTLP/HTTP port (default 4318, env PROCWATCH_PORT)\n"
-        "  -i <seconds>  Process metric interval (default 10, env PROCWATCH_INTERVAL)\n"
-        "  -l <label>    Table prefix; creates <label>_spans and <label>_procs\n"
-        "                (default otel, env PROCWATCH_LABEL)\n"
+        "  -i <seconds>  Host-scrape interval when -A is set (default 10)\n"
         "  -d <conn>     PostgreSQL connection string (env PROCWATCH_DB)\n"
         "  -s <schema>   Schema (default procwatch, env PROCWATCH_SCHEMA)\n"
-        "  -A            Collect every process, not just injected ones\n"
-        "  -M            Disable process metric collection (receiver only)\n",
+        "  -A            Enable optional hostPID /proc scrape for labeled procs\n"
+        "\n"
+        "Tables are named <label>_spans / <label>_procs from each payload's\n"
+        "PROCWATCH_LABEL / procwatch.label; no -l flag is required.\n",
         argv0);
 }
 
@@ -105,32 +194,24 @@ int main(int argc, char **argv) {
     const char *bind_addr = env_or("PROCWATCH_BIND", "0.0.0.0");
     const char *conninfo = env_or("PROCWATCH_DB", DEFAULT_CONNINFO);
     const char *schema = env_or("PROCWATCH_SCHEMA", DEFAULT_SCHEMA);
-    const char *label = env_or("PROCWATCH_LABEL", DEFAULT_LABEL);
     int port = env_int("PROCWATCH_PORT", 4318);
     int interval = env_int("PROCWATCH_INTERVAL", 10);
-    int collect_all = getenv("PROCWATCH_COLLECT_ALL") != NULL;
-    int metrics_enabled = 1;
+    int host_collect = getenv("PROCWATCH_HOST_COLLECT") != NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "b:P:i:l:d:s:AMh")) != -1) {
+    while ((opt = getopt(argc, argv, "b:P:i:d:s:Ah")) != -1) {
         switch (opt) {
             case 'b': bind_addr = optarg; break;
             case 'P': port = atoi(optarg); break;
             case 'i': interval = atoi(optarg); break;
-            case 'l': label = optarg; break;
             case 'd': conninfo = optarg; break;
             case 's': schema = optarg; break;
-            case 'A': collect_all = 1; break;
-            case 'M': metrics_enabled = 0; break;
+            case 'A': host_collect = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
     }
 
-    if (!validate_identifier(label)) {
-        fprintf(stderr, "Error: label must match ^[A-Za-z0-9_]+$ and be <100 chars.\n");
-        return 1;
-    }
     if (!validate_identifier(schema)) {
         fprintf(stderr, "Error: schema must match ^[A-Za-z0-9_]+$ and be <100 chars.\n");
         return 1;
@@ -141,21 +222,17 @@ int main(int argc, char **argv) {
     }
     if (interval <= 0) interval = 10;
 
-    // A dead exporter peer must not take the daemon down with it.
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
     agent_state_t state;
     memset(&state, 0, sizeof state);
+    snprintf(state.schema, sizeof state.schema, "%s", schema);
     state.db = db_connect_or_die(conninfo);
 
-    db_ensure_span_table(state.db, schema, label);
-    db_prepare_span_insert(state.db, schema, label);
-    if (metrics_enabled) {
-        db_ensure_metric_table(state.db, schema, label);
-        db_prepare_metric_insert(state.db, schema, label);
-    }
+    db_ensure_schema(state.db, schema);
+    db_try_enable_timescaledb(state.db);
     db_ensure_drop_inactive_job(state.db, schema);
 
     pw_http_server_t server;
@@ -165,13 +242,13 @@ int main(int argc, char **argv) {
     }
 
     pw_collector_t collector;
-    collector_init(&collector, !collect_all);
+    memset(&collector, 0, sizeof collector);
+    if (host_collect) collector_init(&collector, schema);
 
-    printf("procwatch-agentd: OTLP/HTTP on %s:%d, schema=%s, tables=%s_spans/%s_procs\n",
-           bind_addr, port, schema, label, label);
-    printf("procwatch-agentd: metrics %s (interval %ds, %s)\n",
-           metrics_enabled ? "enabled" : "disabled", interval,
-           collect_all ? "all processes" : "injected processes only");
+    printf("procwatch-agentd: OTLP/HTTP on %s:%d, schema=%s (dynamic labels)\n",
+           bind_addr, port, schema);
+    printf("procwatch-agentd: host scrape %s\n",
+           host_collect ? "enabled (-A)" : "disabled (inject/wrap push)");
     fflush(stdout);
 
     time_t next_tick = time(NULL) + interval;
@@ -179,38 +256,32 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         time_t now = time(NULL);
         int timeout_ms = 1000;
-        if (metrics_enabled) {
+        if (host_collect) {
             long remaining = (long)(next_tick - now) * 1000;
             timeout_ms = (remaining > 0) ? (int)remaining : 0;
-            if (timeout_ms > 1000) timeout_ms = 1000; // stay responsive to signals
+            if (timeout_ms > 1000) timeout_ms = 1000;
         }
 
         http_server_tick(&server, timeout_ms);
 
-        if (metrics_enabled && time(NULL) >= next_tick) {
-            // A dropped connection is the one failure worth recovering from:
-            // the node keeps running while the database restarts.
+        if (host_collect && time(NULL) >= next_tick) {
             if (PQstatus(state.db) != CONNECTION_OK) {
                 fprintf(stderr, "database connection lost, resetting\n");
                 PQreset(state.db);
-                if (PQstatus(state.db) == CONNECTION_OK) {
-                    db_prepare_span_insert(state.db, schema, label);
-                    db_prepare_metric_insert(state.db, schema, label);
-                }
+                db_label_cache_reset();
             }
-            if (PQstatus(state.db) == CONNECTION_OK) {
+            if (PQstatus(state.db) == CONNECTION_OK)
                 collector_tick(&collector, state.db);
-            }
             next_tick = time(NULL) + interval;
         }
     }
 
-    printf("procwatch-agentd: shutting down (%llu spans written, %llu dropped, "
-           "%llu metric samples)\n",
-           state.spans_written, state.spans_dropped, collector.samples_written);
+    printf("procwatch-agentd: shutting down (%llu spans, %llu metrics pushed, "
+           "%llu host samples)\n",
+           state.spans_written, state.metrics_written, collector.samples_written);
 
     http_server_close(&server);
-    collector_free(&collector);
+    if (host_collect) collector_free(&collector);
     PQfinish(state.db);
     return 0;
 }

@@ -41,12 +41,13 @@ mkdir -p "$OUTDIR/lib"
 
 gcc -O2 -Wall -Wextra -Iinclude -fPIC -shared -fvisibility=hidden \
     src/inject/inject.c src/inject/detect.c src/inject/envmod.c \
+    src/inject/metrics_thread.c src/inject/exec_wrap.c src/common/proc_push.c \
     -Wl,--version-script=src/inject/inject.map \
     -Wl,--no-undefined -Wl,-z,now -Wl,-z,relro \
     -o "$OUTDIR/lib/libprocwatch_inject.so"
 
-# musl exposes getauxval and dlsym from libc proper, so libc should still be
-# the only dependency.
+# musl exposes getauxval, dlsym, and pthread from libc proper, so libc should
+# still be the only dependency.
 needed=$(readelf -d "$OUTDIR/lib/libprocwatch_inject.so" |
          sed -n "s/.*Shared library: \[\(.*\)\]/\1/p" |
          grep -v "^libc\.musl" | grep -v "^libc\.so" || true)
@@ -54,10 +55,25 @@ if [ -n "$needed" ]; then
     echo "error: musl injector depends on more than libc: $needed" >&2
     exit 1
 fi
-if nm -D --defined-only "$OUTDIR/lib/libprocwatch_inject.so" | grep -q .; then
-    echo "error: musl injector exports symbols; it must export none" >&2
+bad_exports=$(nm -D --defined-only "$OUTDIR/lib/libprocwatch_inject.so" 2>/dev/null |
+              awk "{print \$3}" |
+              grep -vE "^(__libc_start_main|execve|execvpe|execveat)$" || true)
+if [ -n "$bad_exports" ]; then
+    echo "error: musl injector exports unexpected symbols:" >&2
+    echo "$bad_exports" >&2
     exit 1
 fi
+
+mkdir -p "$OUTDIR/bin"
+# Fully static so the same binary works on Alpine (Go samples) and glibc hosts.
+gcc -O2 -Wall -Wextra -Iinclude -static \
+    src/wrap/wrap.c src/common/proc_push.c \
+    -o "$OUTDIR/bin/procwatch-wrap"
+
+# Prefer this portable wrap in the primary agent tree as well.
+PRIMARY="build/agent/'"$ARCH"'"
+mkdir -p "$PRIMARY/bin"
+cp -f "$OUTDIR/bin/procwatch-wrap" "$PRIMARY/bin/procwatch-wrap"
 
 # Hand the tree back to the invoking user; the container runs as root.
 if [ -n "'"${HOST_UID:-}"'" ]; then
@@ -65,4 +81,4 @@ if [ -n "'"${HOST_UID:-}"'" ]; then
 fi
 '
 
-echo "Built $OUTDIR/lib/libprocwatch_inject.so (musl)"
+echo "Built $OUTDIR/lib/libprocwatch_inject.so and $OUTDIR/bin/procwatch-wrap (musl static)"

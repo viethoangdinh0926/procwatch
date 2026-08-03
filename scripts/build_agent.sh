@@ -26,7 +26,14 @@ AGENT_SRCS=(
     src/proc_scan.c
     src/db.c
 )
-INJECT_SRCS=(src/inject/inject.c src/inject/detect.c src/inject/envmod.c)
+INJECT_SRCS=(
+    src/inject/inject.c
+    src/inject/detect.c
+    src/inject/envmod.c
+    src/inject/metrics_thread.c
+    src/inject/exec_wrap.c
+    src/common/proc_push.c
+)
 
 OUTDIR="build/agent/$ARCH"
 
@@ -41,17 +48,14 @@ else
     LIBDIRS=(/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
 fi
 
-mkdir -p "$OUTDIR/lib" "$OUTDIR/java" "$OUTDIR/python"
+mkdir -p "$OUTDIR/lib" "$OUTDIR/java" "$OUTDIR/python" "$OUTDIR/bin"
 
 # The injector is loaded into every process on the node, so it is built to a
 # stricter standard than the daemon:
 #   --no-undefined     a preloaded object that loads but fails to resolve a
-#                      symbol aborts the process on both glibc and musl, so
-#                      every symbol must be resolved at link time
-#   -fvisibility=hidden plus the version script: export nothing, or we would
-#                      interpose libc functions process-wide by accident
-#   no -lpq, no -lz    libc must remain the only DT_NEEDED, minimising what
-#                      could fail to resolve at load time
+#                      symbol aborts the process on both glibc and musl
+#   -fvisibility=hidden plus the version script: export only interposed symbols
+#   no -lpq, no -lz    libc must remain the only DT_NEEDED
 "$CC" "${CFLAGS[@]}" -fPIC -shared -fvisibility=hidden \
     "${INJECT_SRCS[@]}" \
     -Wl,--version-script=src/inject/inject.map \
@@ -65,18 +69,28 @@ if [ -n "$needed" ]; then
     echo "error: injector must depend only on libc, but also needs: $needed" >&2
     exit 1
 fi
-if nm -D --defined-only "$OUTDIR/lib/libprocwatch_inject.so" | grep -q .; then
-    echo "error: injector exports symbols; it must export none" >&2
+
+# Only the interposed symbols may be exported.
+bad_exports=$(nm -D --defined-only "$OUTDIR/lib/libprocwatch_inject.so" 2>/dev/null |
+              awk '{print $3}' |
+              grep -vE '^(__libc_start_main|execve|execvpe|execveat)$' || true)
+if [ -n "$bad_exports" ]; then
+    echo "error: injector exports unexpected symbols:" >&2
+    echo "$bad_exports" >&2
     exit 1
 fi
 
-# Same $ORIGIN/lib rpath trick as scripts/build.sh: classic DT_RPATH via
-# --disable-new-dtags so it propagates to libpq's own transitive
-# dependencies, which DT_RUNPATH would not do.
+# Same $ORIGIN/lib rpath trick as scripts/build.sh.
 "$CC" "${CFLAGS[@]}" -I/usr/include/postgresql "${AGENT_SRCS[@]}" \
     -Wl,--disable-new-dtags -Wl,-rpath,'$ORIGIN/lib' \
     -lpq -lssl -lcrypto -lz -pthread \
     -o "$OUTDIR/procwatch-agentd"
+
+# Parent-process metric sampler for static binaries (Go). Prefer the musl
+# -static rebuild from scripts/build_inject_musl.sh for Alpine app images;
+# that step overwrites this glibc-dynamic binary in place.
+"$CC" "${CFLAGS[@]}" src/wrap/wrap.c src/common/proc_push.c \
+    -o "$OUTDIR/bin/procwatch-wrap"
 
 # Bundle the transitive closure of shared libs, excluding libc/ld-linux which
 # the base OS always provides. readelf rather than ldd because aarch64 is
@@ -127,7 +141,7 @@ if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
     chown -R "$HOST_UID:$HOST_GID" build 2>/dev/null || true
 fi
 
-echo "Built $OUTDIR/procwatch-agentd and $OUTDIR/lib/libprocwatch_inject.so"
+echo "Built $OUTDIR/procwatch-agentd, $OUTDIR/lib/libprocwatch_inject.so, $OUTDIR/bin/procwatch-wrap"
 if [ ! -f "$OUTDIR/java/javaagent.jar" ]; then
     echo "note: no java/javaagent.jar - run scripts/fetch_runtimes.sh for Java tracing"
 fi

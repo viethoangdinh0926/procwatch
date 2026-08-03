@@ -6,31 +6,22 @@
 
 // Span and process-metric storage for procwatch-agentd.
 //
-// Deliberately additive: none of the functions here modify the tables or DDL
-// that src/db.c creates for the procwatch binary. The span table is a
-// sibling named <label>_spans, so both can share a schema and the existing
-// retention and drop-inactive housekeeping.
+// Tables are keyed by a per-payload label (PROCWATCH_LABEL / procwatch.label).
+// agentd creates <label>_spans and <label>_procs on first sight.
 
-#define PW_SPAN_STMT "pw_ins_span"
-#define PW_METRIC_STMT "pw_ins_metric"
+// Ensures tables exist and prepares insert statements for this label.
+// Returns 0 on success.
+int db_ensure_label(PGconn *conn, const char *schema, const char *label);
 
-// Creates <schema>.<label>_spans as a hypertable with the same 48h retention
-// and activity-tracking behaviour as the metrics table, then prepares the
-// insert statement.
-void db_ensure_span_table(PGconn *conn, const char *schema, const char *label);
-void db_prepare_span_insert(PGconn *conn, const char *schema, const char *label);
-
-// Returns 0 on success. Unlike the procwatch binary, agentd is long-lived and
-// must not exit on a single bad row.
+// Inserts using the prepared statement for span->label. Call db_ensure_label
+// first (or rely on agentd to do so).
 int db_insert_span(PGconn *conn, const pw_span_t *span);
 
-// Process metrics table, extended beyond the procwatch binary's (ts, pid,
-// cpu_pct, rss_kb) with the container and service identity the collector
-// resolves.
-void db_ensure_metric_table(PGconn *conn, const char *schema, const char *label);
-void db_prepare_metric_insert(PGconn *conn, const char *schema, const char *label);
+int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label,
+                             const char *service, const char *container_id,
+                             const char *pod, int pid, const char *comm,
+                             const char *runtime, double cpu_pct, long rss_kb,
+                             long threads);
 
-int db_insert_metric(PGconn *conn, const char *service, const char *container_id,
-                     const char *pod, int pid, const char *comm,
-                     const char *runtime, double cpu_pct, long rss_kb,
-                     long threads);
+// Clears the in-process label cache (e.g. after PQreset).
+void db_label_cache_reset(void);

@@ -1,28 +1,16 @@
-// libprocwatch_inject.so - LD_PRELOAD auto-instrumentation decider.
+// libprocwatch_inject.so - LD_PRELOAD auto-instrumentation decider + metric
+// thread bootstrap.
 //
-// This library is loaded into every process that inherits LD_PRELOAD, so its
-// only job is to decide and to set environment variables. The actual
-// instrumentation is loaded afterwards by the runtime's own supported hook
-// (-javaagent for the JVM, sitecustomize for CPython). Keeping the heavy
-// lifting out of here means a bug in an agent degrades one application
-// instead of bricking every process on the host.
-//
-// Constraints that follow from that, and that must not be relaxed:
-//   - No undefined symbols, enforced at link time with --no-undefined. A
-//     preloaded object that loads but cannot resolve a symbol aborts the
-//     process with a relocation error on both glibc and musl (measured:
-//     exit 127 for every command, including the shell you would use to
-//     repair it). By contrast, an object that cannot be loaded at all is
-//     merely warned about and ignored, so failing to load is safe and
-//     failing to relocate is not.
-//   - libc is the only DT_NEEDED, which keeps the set of symbols that could
-//     fail to resolve as small as it can be.
-//   - Nothing is exported. A stray exported getenv or malloc would replace
-//     the real one process-wide.
-//   - No dlopen: we are inside the loader's init phase.
-//   - Every failure is swallowed. No assert, no abort, no exit.
+// Constraints that must not be relaxed:
+//   - No undefined symbols (--no-undefined). A preloaded object that loads
+//     but cannot resolve a symbol aborts the process on both glibc and musl.
+//   - libc is the only DT_NEEDED.
+//   - Export only the interposed symbols (__libc_start_main, execve, ...).
+//   - No dlopen from the constructor.
+//   - Every failure is swallowed.
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +19,7 @@
 #include <sys/auxv.h>
 
 #include "../../include/inject.h"
+#include "../../include/proc_push.h"
 
 #ifndef PW_DEFAULT_AGENT_DIR
 #define PW_DEFAULT_AGENT_DIR "/opt/procwatch/agent"
@@ -39,6 +28,8 @@
 #define PW_DEFAULT_ENDPOINT "http://127.0.0.1:4318"
 
 static int g_debug = 0;
+static int g_armed = 0;
+static const char *g_runtime_hint = "other";
 
 void pw_debug(const char *fmt, ...) {
     if (!g_debug) return;
@@ -50,9 +41,38 @@ void pw_debug(const char *fmt, ...) {
     fputc('\n', stderr);
 }
 
+int pw_injection_armed(void) { return g_armed; }
+void pw_set_injection_armed(int armed) { g_armed = armed; }
+const char *pw_runtime_hint(void) { return g_runtime_hint; }
+void pw_set_runtime_hint(const char *hint) {
+    g_runtime_hint = (hint && *hint) ? hint : "other";
+}
+
 const char *pw_agent_dir(void) {
     const char *dir = getenv("PROCWATCH_AGENT_DIR");
     return (dir && *dir) ? dir : PW_DEFAULT_AGENT_DIR;
+}
+
+const char *pw_resolve_label(void) {
+    const char *label = getenv("PROCWATCH_LABEL");
+    if (!pw_label_valid(label)) return NULL;
+    return label;
+}
+
+void pw_attach_label_to_otel(const char *label) {
+    if (!label || !*label) return;
+    char attr[160];
+    snprintf(attr, sizeof attr, "procwatch.label=%s", label);
+    const char *cur = getenv("OTEL_RESOURCE_ATTRIBUTES");
+    if (cur && strstr(cur, "procwatch.label=")) return;
+    if (!cur || !*cur) {
+        setenv("OTEL_RESOURCE_ATTRIBUTES", attr, 1);
+        return;
+    }
+    char buf[8192];
+    if (strlen(cur) + 1 + strlen(attr) + 1 > sizeof buf) return;
+    snprintf(buf, sizeof buf, "%s,%s", cur, attr);
+    setenv("OTEL_RESOURCE_ATTRIBUTES", buf, 1);
 }
 
 static int path_exists(const char *path) {
@@ -66,9 +86,6 @@ static const char *exec_basename(void) {
     return slash ? slash + 1 : execfn;
 }
 
-// Service name precedence: an explicit OTEL_SERVICE_NAME wins, then
-// PROCWATCH_SERVICE, then the executable basename so that something useful
-// still lands in the database when nothing was configured.
 static const char *resolve_service_name(void) {
     const char *name = getenv("OTEL_SERVICE_NAME");
     if (name && *name) return name;
@@ -79,19 +96,17 @@ static const char *resolve_service_name(void) {
 }
 
 void pw_apply_common(void) {
+    const char *label = pw_resolve_label();
+    if (label) pw_attach_label_to_otel(label);
+
     const char *service = resolve_service_name();
     pw_env_set_default("OTEL_SERVICE_NAME", service);
-
-    // The collector reads this back out of /proc/<pid>/environ to label
-    // process metrics with the same service name the spans carry.
     setenv("PROCWATCH_SERVICE", service, 1);
 
     const char *endpoint = getenv("PROCWATCH_ENDPOINT");
     if (!endpoint || !*endpoint) endpoint = PW_DEFAULT_ENDPOINT;
     pw_env_set_default("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
 
-    // procwatch-agentd speaks OTLP over HTTP only; gRPC would need a second
-    // server and HTTP/2 framing for no benefit here.
     pw_env_set_default("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
     pw_env_set_default("OTEL_TRACES_EXPORTER", "otlp");
     pw_env_set_default("OTEL_METRICS_EXPORTER", "otlp");
@@ -101,47 +116,31 @@ void pw_apply_common(void) {
 void pw_apply_java(const char *agent_dir) {
     char jar[1024];
     snprintf(jar, sizeof jar, "%s/java/javaagent.jar", agent_dir);
-
-    // A -javaagent pointing at a missing jar aborts JVM startup outright, so
-    // an unmounted payload would take the application down. Checking first
-    // turns that from an outage into a no-op.
     if (!path_exists(jar)) {
         pw_debug("no java agent at %s, skipping", jar);
         return;
     }
-
     char opt[1152];
-    // Leading space, and append rather than overwrite: the JVMTI spec asks
-    // tools to share JAVA_TOOL_OPTIONS rather than claim it.
     snprintf(opt, sizeof opt, " -javaagent:%s", jar);
-
-    if (pw_env_append("JAVA_TOOL_OPTIONS", opt, jar) == 0) {
+    if (pw_env_append("JAVA_TOOL_OPTIONS", opt, jar) == 0)
         pw_debug("injected java agent %s", jar);
-    }
 }
 
 void pw_apply_python(const char *agent_dir) {
     char shim_dir[1024];
     snprintf(shim_dir, sizeof shim_dir, "%s/python", agent_dir);
-
     char shim[1088];
     snprintf(shim, sizeof shim, "%s/sitecustomize.py", shim_dir);
     if (!path_exists(shim)) {
         pw_debug("no python shim at %s, skipping", shim);
         return;
     }
-
-    // Prepended so our sitecustomize shadows any other one on the path; site
-    // imports the first it finds.
-    if (pw_env_prepend("PYTHONPATH", shim_dir, shim_dir, ':') == 0) {
+    if (pw_env_prepend("PYTHONPATH", shim_dir, shim_dir, ':') == 0)
         pw_debug("injected python shim %s", shim_dir);
-    }
 }
 
 __attribute__((constructor))
 static void pw_init(void) {
-    // Guard against a second constructor run inside one image. Re-exec still
-    // gets a fresh copy, which is why the env helpers are idempotent too.
     static int applied = 0;
     if (applied) return;
     applied = 1;
@@ -154,12 +153,13 @@ static void pw_init(void) {
         return;
     }
 
-    // The loader already drops LD_PRELOAD under AT_SECURE, and HotSpot
-    // independently ignores JAVA_TOOL_OPTIONS when privileges differ. Bail
-    // out explicitly rather than half-configuring a process that will not
-    // honour the result.
     if (geteuid() != getuid() || getegid() != getgid()) {
         pw_debug("privileged process, skipping");
+        return;
+    }
+
+    if (!pw_resolve_label()) {
+        pw_debug("PROCWATCH_LABEL missing or invalid; skipping injection");
         return;
     }
 
@@ -175,10 +175,14 @@ static void pw_init(void) {
         case PW_RT_JAVA:
             pw_apply_common();
             pw_apply_java(agent_dir);
+            pw_set_runtime_hint("java");
+            pw_set_injection_armed(1);
             break;
         case PW_RT_PYTHON:
             pw_apply_common();
             pw_apply_python(agent_dir);
+            pw_set_runtime_hint("python");
+            pw_set_injection_armed(1);
             break;
         default:
             break;

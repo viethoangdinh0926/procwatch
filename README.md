@@ -126,98 +126,98 @@ targets.
 
 | Artifact | Role |
 | --- | --- |
-| `libprocwatch_inject.so` | `LD_PRELOAD` library that detects the runtime and sets environment variables. Does no telemetry work itself. |
-| `procwatch-agentd` | Daemon that receives OTLP/HTTP, decodes it, and writes spans and process metrics to TimescaleDB. |
+| `libprocwatch_inject.so` | `LD_PRELOAD` library: runtime env bootstrap, OTEL label attachment, metric pthread, execve env maintenance. |
+| `procwatch-wrap` | Parent sampler for static binaries (e.g. Go): fork/exec the app, sample `/proc/<child>`, POST the same JSON. |
+| `procwatch-agentd` | Receives OTLP/HTTP and `POST /v1/procmetrics`; creates `<label>_spans` / `<label>_procs` on first sight. |
 | `java/javaagent.jar` | Upstream OpenTelemetry Java agent, loaded via `-javaagent`. |
 | `python/` | `sitecustomize.py` shim plus per-ABI vendored OpenTelemetry packages. |
 
 ```
-Application pod                          Node DaemonSet
-┌───────────────────────────┐            ┌────────────────────────┐
-│ libprocwatch_inject.so    │            │ OTLP/HTTP receiver     │
-│   ├─ Java   → JAVA_TOOL_OPTIONS        │   :4318                │──┐
-│   ├─ Python → PYTHONPATH  │──OTLP──────▶│                        │  │
-│   └─ Go     → not injected│            │ /proc collector        │  ├─▶ TimescaleDB
-└───────────────────────────┘            │   (hostPID)            │──┘
-             └────────────── scraped ────▶└────────────────────────┘
+Single demo pod
+┌────────────────────────────────────────┐
+│ agentd :4318                           │──▶ TimescaleDB
+│   OTLP /v1/traces + /v1/procmetrics    │
+│                                        │
+│ checkout (Java)  LD_PRELOAD ──OTLP/JSON▶│
+│ payments (Python) LD_PRELOAD ─OTLP/JSON▶│
+│ inventory (Go)   procwatch-wrap ─JSON──▶│
+└────────────────────────────────────────┘
+         (127.0.0.1 shared netns)
 ```
 
-The split is deliberate. The preloaded library is loaded into *every* process
-on the node, so it only decides and sets environment variables; the actual
-instrumentation is loaded afterwards by each runtime's own supported hook. A
-bug in an agent then degrades one application instead of every process on the
-host.
+Tables are keyed by each payload’s `PROCWATCH_LABEL` (also attached to OTLP as
+`procwatch.label`). `agentd` does not take `-l`; the first metric or span for a
+label creates `<label>_procs` / `<label>_spans`. The optional hostPID scrape
+(`-A` / `PROCWATCH_HOST_COLLECT`) is off by default so inject/wrap pushes are
+not double-counted.
 
 ## How injection works
 
-The injector's constructor runs before `main()` and:
+Requires a valid `PROCWATCH_LABEL` (`^[A-Za-z0-9_]+$`). Without it the injector
+skips OTEL bootstrap and the metric thread.
+
+The ELF constructor (before `main`):
 
 1. Checks the kill switch `PROCWATCH_INJECT_DISABLED=1`.
-2. Rejects anything whose executable basename is not a known runtime, using
-   `getauxval(AT_EXECFN)`. Every `sh`, `cp`, and `ls` in the container stops
-   here, at roughly the cost of the `mmap`.
-3. Confirms the runtime with `dlsym(RTLD_DEFAULT, ...)`, probing `JLI_Launch`
-   for Java and `Py_BytesMain` for CPython.
-4. Rewrites the environment idempotently.
+2. Rejects unknown executable basenames via `getauxval(AT_EXECFN)`.
+3. Confirms the runtime with `dlsym` (`JLI_Launch` / `Py_BytesMain`).
+4. Rewrites the environment idempotently and appends
+   `procwatch.label=<label>` to `OTEL_RESOURCE_ATTRIBUTES`.
 
-Timing is safe because ELF constructors run long before HotSpot reads
-`JAVA_TOOL_OPTIONS` inside `JNI_CreateJavaVM`, and before CPython reads
-`PYTHONPATH` in `config_read_env_vars`.
+Separately, `__libc_start_main` is interposed so a detached metric pthread
+starts *after* the loader lock and *before* application `main`. The thread
+samples `/proc/self` every `PROCWATCH_METRIC_INTERVAL` (default 10s) and POSTs
+JSON to `{PROCWATCH_ENDPOINT}/v1/procmetrics` over raw sockets (no libcurl).
 
-Idempotency is mandatory rather than defensive: the JDK launcher re-execs
-itself, so the constructor runs more than once per `java` invocation, and an
-unguarded append would add `-javaagent` twice.
+`execve` / `execvpe` / `execveat` are interposed so a rebuilt `envp` still
+carries `PROCWATCH_LABEL`, `LD_PRELOAD`, and related vars across process-tree
+re-execs (e.g. the JDK launcher).
+
+Idempotency is mandatory: the JDK re-execs itself, so the constructor runs
+more than once per `java` invocation.
 
 ## Runtime support and limits
 
 | Runtime | Traces | Process metrics | Notes |
 | --- | --- | --- | --- |
-| Java 8+ | Yes | Yes | Upstream OpenTelemetry Java agent. |
-| CPython 3.x | Yes | Yes | Needs a vendored tree matching the interpreter's exact minor version and libc. |
-| Go | **No** | Yes | See below. |
+| Java 8+ | Yes | Yes (inject thread) | Upstream OpenTelemetry Java agent. |
+| CPython 3.x | Yes | Yes (inject thread) | Vendored tree must match interpreter minor + libc. |
+| Static Go | **No** | Yes (`procwatch-wrap`) | No `PT_INTERP`; wrap is required. |
 
-**Go is metrics-only, and this is structural.** Go binaries are normally
-statically linked and have no `PT_INTERP`, so `ld.so` never runs and
-`LD_PRELOAD` is ignored outright. Even a cgo-enabled dynamic build gains
-nothing, because the Go runtime issues syscalls directly rather than through
-libc wrappers and has no equivalent of `JAVA_TOOL_OPTIONS`. Go workloads are
-still visible in `<label>_procs`, collected through `/proc`, with no
-privileges required inside the pod. For Go traces the options are the
-OpenTelemetry Go SDK in the application, or eBPF-based instrumentation as a
-privileged DaemonSet.
+**Static Go cannot get an in-process metric thread via `LD_PRELOAD`.** There is
+no dynamic linker, so the injector never loads. Use
+`command: ["/opt/procwatch/agent/bin/procwatch-wrap", "--", "<app>", …]` with
+the same `PROCWATCH_LABEL` / `PROCWATCH_ENDPOINT`. For Go traces, use the
+OpenTelemetry Go SDK in-app or a privileged eBPF agent; both are out of scope
+here.
 
-Other cases that are deliberately not handled:
+Other cases deliberately not handled:
 
-- **setuid/setgid binaries.** The loader strips `LD_PRELOAD` under `AT_SECURE`,
-  and HotSpot independently ignores `JAVA_TOOL_OPTIONS` when
-  `os::have_special_privileges()`. The injector detects this and returns early.
-- **Callers that build an explicit `envp`.** A parent that execs with a
-  hand-built environment drops the injected variables. Interposing `execve`
-  would address this and is not implemented.
-- **Python ABI matching.** Wheels such as `grpcio` carry compiled extensions
-  bound to one CPython version *and* one libc. The shim dispatches on
-  `sys.version_info` at runtime and loads the matching `cp3XX` tree; if none
-  exists it logs (under `PROCWATCH_INJECT_DEBUG=1`) and does nothing. Build
-  the trees you need with `PYTHON_VERSIONS="3.11 3.12" make runtimes`.
-- **Alpine/musl images need `lib-musl/libprocwatch_inject.so`.** The glibc
-  build names `libc.so.6` as a dependency, which musl cannot satisfy. Loaders
-  ignore an object they cannot open, so the pod starts normally and simply
-  produces no traces — a silent failure worth knowing about.
+- **setuid/setgid binaries.** The loader strips `LD_PRELOAD` under `AT_SECURE`.
+- **Python ABI matching.** Build the trees you need with
+  `PYTHON_VERSIONS="3.11 3.12" make runtimes`.
+- **Alpine/musl images need the musl injector**
+  (`build/agent/<arch>-musl/lib/…`). A glibc `.so` is a silent no-op on musl.
+- **Automatic Go entrypoint rewrite.** Manifests must use `procwatch-wrap`
+  manually (no mutating webhook yet).
 
-A related failure mode is worth stating precisely, because it applies to
-*both* libcs: a preloaded object that loads but cannot resolve a symbol
-aborts the process with a relocation error, exit 127, for every command that
-starts. That is why the injector links with `-Wl,--no-undefined`, keeps libc
-as its only dependency, and is verified at build time to export no symbols
-(an exported `getenv` or `malloc` would be interposed process-wide).
-
+The injector links with `-Wl,--no-undefined`, keeps libc as its only
+`DT_NEEDED`, and exports only the interposed symbols (`__libc_start_main`,
+`execve`, `execvpe`, `execveat`). An unresolved preload symbol aborts every
+process with exit 127.
 ## Building
 
 ```bash
-make runtimes    # download the Java agent and build the Python trees
-make agent       # agentd + injector for x86_64, aarch64, and musl
-make world       # everything, including the original procwatch binary
+make runtimes           # download the Java agent and build the Python trees
+make agent-x86_64       # agentd + glibc injector + wrap
+make agent-musl-x86_64  # musl injector + musl-static wrap (needed for Alpine Go)
+make agent              # all arches (glibc + musl)
+make world              # everything, including the original procwatch binary
 ```
+
+`procwatch-wrap` must be the musl-static build to run inside Alpine/scratch Go
+images; `make agent-musl-x86_64` writes that binary into
+`build/agent/x86_64/bin/procwatch-wrap`.
 
 `make all` still builds only the `procwatch` binary.
 
@@ -228,61 +228,60 @@ the existing binary: `libpq` and its transitive dependencies are copied into
 ## Running locally
 
 ```bash
-docker compose -f examples/docker-compose.yml up --build
+make runtimes && make agent-x86_64 && make agent-musl-x86_64
+docker compose -f examples/docker-compose.yml -p pwdemo up --build
 ```
 
-This starts TimescaleDB, `procwatch-agentd`, and one workload per runtime.
-Java and Python produce spans within a few seconds; all three produce process
-metrics.
+Java/Python produce spans and inject-thread metrics into `checkout_*` /
+`payments_*`. Go uses `procwatch-wrap` and lands metrics in `inventory_procs`.
+`agentd` is started with no `-l`; tables appear on first payload.
 
 Standalone:
 
 ```bash
-procwatch-agentd -P 4318 -i 10 -l otel -s procwatch -d "<conn_str>"
+procwatch-agentd -P 4318 -s procwatch -d "<conn_str>"
 ```
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `-b` | `PROCWATCH_BIND` | `0.0.0.0` | Listen address |
-| `-P` | `PROCWATCH_PORT` | `4318` | OTLP/HTTP port |
-| `-i` | `PROCWATCH_INTERVAL` | `10` | Metric interval, seconds |
-| `-l` | `PROCWATCH_LABEL` | `otel` | Table prefix |
+| `-P` | `PROCWATCH_PORT` | `4318` | OTLP/HTTP + procmetrics port |
+| `-i` | `PROCWATCH_INTERVAL` | `10` | Host-scrape interval when `-A` is set |
 | `-s` | `PROCWATCH_SCHEMA` | `procwatch` | Schema |
 | `-d` | `PROCWATCH_DB` | see `-h` | Connection string |
-| `-A` | `PROCWATCH_COLLECT_ALL` | off | Record every process, not just injected ones |
-| `-M` | — | off | Receiver only, no metric collection |
+| `-A` | `PROCWATCH_HOST_COLLECT` | off | Optional node-wide `/proc` scrape of labeled procs |
 
-Injected applications read these:
+Application / wrap env:
 
 | Variable | Purpose |
 | --- | --- |
-| `PROCWATCH_INJECT_DISABLED=1` | Kill switch; skips all injection |
+| `PROCWATCH_LABEL` | **Required.** Table key; also set as OTLP `procwatch.label` |
+| `PROCWATCH_INJECT_DISABLED=1` | Kill switch; skips injection + metric thread |
 | `PROCWATCH_INJECT_DEBUG=1` | Log injection decisions to stderr |
 | `PROCWATCH_AGENT_DIR` | Agent tree location (default `/opt/procwatch/agent`) |
-| `PROCWATCH_ENDPOINT` | Collector endpoint (default `http://127.0.0.1:4318`) |
-| `PROCWATCH_SERVICE` | Service name the collector joins metrics on |
+| `PROCWATCH_ENDPOINT` | Collector base URL (default `http://127.0.0.1:4318`) |
+| `PROCWATCH_SERVICE` | Service name on metrics (and OTEL service.name when set) |
+| `PROCWATCH_METRIC_INTERVAL` | Inject/wrap sample period, seconds (default 10) |
 
 ## Kubernetes
 
 ```bash
-kubectl apply -f deploy/k8s/daemonset-agentd.yaml
-kubectl apply -f deploy/k8s/example-java-deployment.yaml
+kubectl apply -f deploy/k8s/example-apps-deployment.yaml
 ```
 
-`agentd` runs as a DaemonSet with `hostPID: true`, which is what lets one
-collector see every process on the node. Applications get an init container
-that copies the agent tree into a shared `emptyDir`, then set `LD_PRELOAD`
-and point `PROCWATCH_ENDPOINT` at `status.hostIP` through the Downward API.
-
-A mutating admission webhook would make this automatic and is not included;
-the init-container pattern is the same mechanism the OpenTelemetry Operator
-uses and is far easier to debug.
+The example Deployment is a single pod with `agentd`, Java, Python, and Go.
+Apps send OTLP and `/v1/procmetrics` to `http://127.0.0.1:4318` (shared
+network namespace). Java/Python set `LD_PRELOAD`; Go uses `procwatch-wrap`.
+Each app container requires its own `PROCWATCH_LABEL` and binds a distinct
+`PORT`. Replace the `procwatch-db` Secret with your TimescaleDB connection
+string before applying.
 
 ## Schema
 
-Both tables are hypertables with the same 48-hour retention and
-`drop_inactive_tables` housekeeping as the existing metrics table. The
-`<schema>.<label>` table used by the `procwatch` binary is untouched.
+Tables are created dynamically per label. Hypertables use the same 48-hour
+retention and `drop_inactive_tables` housekeeping as the classic `procwatch`
+metrics table. The `<schema>.<label>` table used by the standalone `procwatch`
+binary is untouched.
 
 `<schema>.<label>_spans`:
 
@@ -298,11 +297,8 @@ Both tables are hypertables with the same 48-hour retention and
 `<schema>.<label>_procs`: `ts`, `service_name`, `container_id`, `pod`, `pid`,
 `comm`, `runtime`, `cpu_pct`, `rss_kb`, `threads`.
 
-`service_name` is the join key between the two: the injector plants
-`PROCWATCH_SERVICE` in the process environment, and the collector reads it
-back out of `/proc/<pid>/environ`, so spans and metrics agree on the name even
-for Go services that emit no spans.
-
+`service_name` joins the two tables. Spans without `procwatch.label` are
+rejected so unlabeled data cannot land in a mystery table.
 ## Grafana queries for traces
 
 **Slowest operations:**
@@ -393,11 +389,13 @@ shim both explain what they decided.
 
 | Symptom | Likely cause |
 | --- | --- |
+| Injector skips everything | Missing/invalid `PROCWATCH_LABEL` |
 | `java -version` does not print `Picked up JAVA_TOOL_OPTIONS` | `LD_PRELOAD` not set, wrong path, or a setuid binary |
-| Java starts but no spans | `javaagent.jar` missing from the agent tree; the injector skips a `-javaagent` it cannot find, because pointing the JVM at a missing jar aborts startup |
-| Python initialises but emits no spans | No `cp3XX` tree for that interpreter, or a tree with no instrumentation packages |
-| No spans from an Alpine pod | Using `lib/` instead of `lib-musl/` |
-| No metrics for any pod | `hostPID: true` missing, or `agentd` lacks the privileges to read `/proc/<pid>/environ` |
-| Metrics but only for some processes | Expected: only injected processes are recorded unless `-A` is passed |
+| Java starts but no spans | `javaagent.jar` missing; injector skips a `-javaagent` it cannot find |
+| Python initialises but emits no spans | No `cp3XX` tree for that interpreter |
+| No spans from an Alpine pod | Using glibc injector instead of musl |
+| Spans rejected / no `_spans` table | OTLP resource missing `procwatch.label` (injector did not attach it) |
+| No `_procs` rows | Endpoint unreachable from the inject thread / wrap, or label never POSTed |
+| Go has no metrics | Entrypoint not wrapped with `procwatch-wrap` |
 </content>
 </invoke>

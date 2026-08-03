@@ -6,13 +6,16 @@
 #define PW_SERVICE_MAX 256
 #define PW_CONTAINER_ID_MAX 80
 #define PW_COMM_MAX 64
+#define PW_LABEL_MAX 100
 
-// A process the collector is tracking, with enough state to turn cumulative
-// jiffie counters into a CPU percentage across samples.
+// Optional hostPID fallback collector. Prefer inject-thread / wrap pushes;
+// enable with -A only when you still want node-wide scrape of labeled procs.
+
 typedef struct {
     pid_t pid;
-    unsigned long long starttime;   // guards against PID reuse between ticks
+    unsigned long long starttime;
     unsigned long long proc_time;
+    char label[PW_LABEL_MAX];
     char service[PW_SERVICE_MAX];
     char container_id[PW_CONTAINER_ID_MAX];
     char pod[PW_SERVICE_MAX];
@@ -32,16 +35,10 @@ typedef struct {
     long page_kb;
     long ncpu;
 
-    // Only processes carrying PROCWATCH_SERVICE in their environment are
-    // recorded when set, which keeps a hostPID DaemonSet from writing a row
-    // for every process on the node.
-    int require_service_env;
+    char schema[PW_LABEL_MAX];
     unsigned long long samples_written;
 } pw_collector_t;
 
-void collector_init(pw_collector_t *c, int require_service_env);
+void collector_init(pw_collector_t *c, const char *schema);
 void collector_free(pw_collector_t *c);
-
-// Walks /proc, computes deltas against the previous tick, and writes one row
-// per tracked process. Returns the number of rows written.
 int collector_tick(pw_collector_t *c, PGconn *conn);
