@@ -1,9 +1,9 @@
 // procwatch-agentd - OTLP receiver and process-metric ingest.
 //
 // Tables are keyed by PROCWATCH_LABEL / procwatch.label on each payload.
-// Process metrics normally arrive via POST /v1/procmetrics from the inject
-// thread or procwatch-wrap; optional -A enables a hostPID /proc scrape.
-// When the DB is down, payloads are spilled locally and flushed on reconnect.
+// Process metrics arrive via POST /v1/procmetrics from the inject thread or
+// procwatch-wrap. When the DB is down, payloads are spilled locally and
+// flushed on reconnect.
 
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -23,7 +23,6 @@
 #include "../../include/agent/http_server.h"
 #include "../../include/agent/otlp.h"
 #include "../../include/agent/db_otlp.h"
-#include "../../include/agent/collector.h"
 
 static const char *DEFAULT_CONNINFO =
     "postgresql://procwatcher:procwatcherpw@127.0.0.1:5433/procwatcherdb";
@@ -105,7 +104,7 @@ static void mark_offline(agent_state_t *st) {
 }
 
 static int write_metric(agent_state_t *st, const char *label, const char *service,
-                        const char *container_id, const char *pod, int pid,
+                        const char *container_id, const char *pod, const char *pid,
                         const char *comm, const char *runtime, double cpu,
                         long rss, long threads) {
     if (st->dbbuf.online && st_conn(st) &&
@@ -118,20 +117,21 @@ static int write_metric(agent_state_t *st, const char *label, const char *servic
     }
     mark_offline(st);
 
-    char elabel[200], esvc[512], ecomm[128], ert[64], epod[512], ecid[160];
+    char elabel[200], esvc[512], ecomm[128], ert[64], epod[512], ecid[160], epid[160];
     pw_json_escape(elabel, sizeof elabel, label);
     pw_json_escape(esvc, sizeof esvc, service ? service : "");
     pw_json_escape(ecomm, sizeof ecomm, comm ? comm : "");
     pw_json_escape(ert, sizeof ert, runtime ? runtime : "other");
     pw_json_escape(epod, sizeof epod, pod ? pod : "");
     pw_json_escape(ecid, sizeof ecid, container_id ? container_id : "");
+    pw_json_escape(epid, sizeof epid, pid ? pid : "");
 
     char line[2048];
     snprintf(line, sizeof line,
              "{\"k\":\"metric\",\"schema\":\"%s\",\"label\":\"%s\",\"service\":\"%s\","
-             "\"container_id\":\"%s\",\"pod\":\"%s\",\"pid\":%d,\"comm\":\"%s\","
+             "\"container_id\":\"%s\",\"pod\":\"%s\",\"pid\":\"%s\",\"comm\":\"%s\","
              "\"runtime\":\"%s\",\"cpu\":%.10g,\"rss\":%ld,\"threads\":%ld}",
-             st->schema, elabel, esvc, ecid, epod, pid, ecomm, ert, cpu, rss, threads);
+             st->schema, elabel, esvc, ecid, epod, epid, ecomm, ert, cpu, rss, threads);
     if (pw_db_buf_spill(&st->dbbuf, line) == 0) ++st->metrics_spilled;
     return 0; // accepted into spill
 }
@@ -181,8 +181,8 @@ static int write_span(agent_state_t *st, const pw_span_t *span) {
 
 static int handle_procmetrics(agent_state_t *st, const uint8_t *body, size_t len) {
     char label[100] = "", service[256] = "", comm[64] = "", runtime[32] = "other";
-    char pod[256] = "", container_id[80] = "";
-    double pid_d = 0, cpu = 0, rss = 0, threads = 0;
+    char pod[256] = "", container_id[80] = "", pid_key[80] = "";
+    double cpu = 0, rss = 0, threads = 0;
 
     if (json_str((const char *)body, len, "label", label, sizeof label) != 0)
         return -1;
@@ -193,13 +193,19 @@ static int handle_procmetrics(agent_state_t *st, const uint8_t *body, size_t len
     json_str((const char *)body, len, "runtime", runtime, sizeof runtime);
     json_str((const char *)body, len, "pod", pod, sizeof pod);
     json_str((const char *)body, len, "container_id", container_id, sizeof container_id);
-    json_num((const char *)body, len, "pid", &pid_d);
+    if (json_str((const char *)body, len, "pid", pid_key, sizeof pid_key) != 0) {
+        // Backward compatible with numeric "pid":123
+        double pid_d = 0;
+        if (json_num((const char *)body, len, "pid", &pid_d) == 0)
+            snprintf(pid_key, sizeof pid_key, "%d", (int)pid_d);
+    }
     json_num((const char *)body, len, "cpu_pct", &cpu);
     json_num((const char *)body, len, "rss_kb", &rss);
     json_num((const char *)body, len, "threads", &threads);
 
     if (!service[0]) snprintf(service, sizeof service, "%s", comm[0] ? comm : "unknown");
-    return write_metric(st, label, service, container_id, pod, (int)pid_d, comm,
+    if (!pid_key[0]) snprintf(pid_key, sizeof pid_key, "unknown");
+    return write_metric(st, label, service, container_id, pod, pid_key, comm,
                         runtime, cpu, (long)rss, (long)threads);
 }
 
@@ -240,8 +246,8 @@ static int replay_line(const char *line, size_t len, void *user) {
 
     if (strncmp(line, "{\"k\":\"metric\"", 13) == 0) {
         char label[100] = "", service[256] = "", comm[64] = "", runtime[32] = "other";
-        char pod[256] = "", container_id[80] = "";
-        double pid_d = 0, cpu = 0, rss = 0, threads = 0;
+        char pod[256] = "", container_id[80] = "", pid_key[80] = "";
+        double cpu = 0, rss = 0, threads = 0;
         if (json_str(line, len, "label", label, sizeof label) != 0) return 0;
         if (!validate_identifier(label)) return 0;
         json_str(line, len, "service", service, sizeof service);
@@ -249,13 +255,18 @@ static int replay_line(const char *line, size_t len, void *user) {
         json_str(line, len, "runtime", runtime, sizeof runtime);
         json_str(line, len, "pod", pod, sizeof pod);
         json_str(line, len, "container_id", container_id, sizeof container_id);
-        json_num(line, len, "pid", &pid_d);
+        if (json_str(line, len, "pid", pid_key, sizeof pid_key) != 0) {
+            double pid_d = 0;
+            if (json_num(line, len, "pid", &pid_d) == 0)
+                snprintf(pid_key, sizeof pid_key, "%d", (int)pid_d);
+        }
         json_num(line, len, "cpu", &cpu);
         json_num(line, len, "rss", &rss);
         json_num(line, len, "threads", &threads);
+        if (!pid_key[0]) snprintf(pid_key, sizeof pid_key, "unknown");
         if (db_ensure_label(st_conn(st), st->schema, label) != 0) return -1;
         if (db_insert_metric_labeled(st_conn(st), st->schema, label, service,
-                                     container_id, pod, (int)pid_d, comm, runtime,
+                                     container_id, pod, pid_key, comm, runtime,
                                      cpu, (long)rss, (long)threads) != 0)
             return -1;
         ++st->metrics_written;
@@ -299,20 +310,19 @@ static int replay_line(const char *line, size_t len, void *user) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s [-b bind_addr] [-P port] [-i interval_sec]\n"
+        "Usage: %s [-b bind_addr] [-P port]\n"
         "          [-d conn_str] [-s schema] [-R retention_hours] [-T inactive_hours]\n"
-        "          [-A] [-h]\n"
+        "          [-h]\n"
         "  -b <addr>     Listen address (default 0.0.0.0, env PROCWATCH_BIND)\n"
         "  -P <port>     OTLP/HTTP port (default 4318, env PROCWATCH_PORT)\n"
-        "  -i <seconds>  Host-scrape interval when -A is set (default 10)\n"
         "  -d <conn>     PostgreSQL connection string (env PROCWATCH_DB)\n"
         "  -s <schema>   Schema (default procwatch, env PROCWATCH_SCHEMA)\n"
         "  -R <hours>    Timescale chunk retention (default %d, env PROCWATCH_RETENTION_HOURS)\n"
         "  -T <hours>    Drop tables idle longer than this (default %d, env PROCWATCH_INACTIVE_HOURS)\n"
-        "  -A            Enable optional hostPID /proc scrape for labeled procs\n"
         "\n"
         "Tables are named <label>_spans / <label>_procs from each payload's\n"
         "PROCWATCH_LABEL / procwatch.label; no -l flag is required.\n"
+        "Process metrics are pushed by inject threads / procwatch-wrap.\n"
         "If the database is unreachable, data is spilled under PROCWATCH_SPILL_DIR\n"
         "(default /var/tmp/procwatch) and flushed on reconnect.\n",
         argv0, PW_DEFAULT_RETENTION_HOURS, PW_DEFAULT_INACTIVE_HOURS);
@@ -335,22 +345,18 @@ int main(int argc, char **argv) {
     const char *conninfo = env_or("PROCWATCH_DB", DEFAULT_CONNINFO);
     const char *schema = env_or("PROCWATCH_SCHEMA", DEFAULT_SCHEMA);
     int port = env_int("PROCWATCH_PORT", 4318);
-    int interval = env_int("PROCWATCH_INTERVAL", 10);
-    int host_collect = getenv("PROCWATCH_HOST_COLLECT") != NULL;
     int retention_hours = env_int("PROCWATCH_RETENTION_HOURS", PW_DEFAULT_RETENTION_HOURS);
     int inactive_hours = env_int("PROCWATCH_INACTIVE_HOURS", PW_DEFAULT_INACTIVE_HOURS);
 
     int opt;
-    while ((opt = getopt(argc, argv, "b:P:i:d:s:R:T:Ah")) != -1) {
+    while ((opt = getopt(argc, argv, "b:P:d:s:R:T:h")) != -1) {
         switch (opt) {
             case 'b': bind_addr = optarg; break;
             case 'P': port = atoi(optarg); break;
-            case 'i': interval = atoi(optarg); break;
             case 'd': conninfo = optarg; break;
             case 's': schema = optarg; break;
             case 'R': retention_hours = atoi(optarg); break;
             case 'T': inactive_hours = atoi(optarg); break;
-            case 'A': host_collect = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
@@ -364,7 +370,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: port must be 1-65535.\n");
         return 1;
     }
-    if (interval <= 0) interval = 10;
     if (retention_hours <= 0 || inactive_hours <= 0) {
         fprintf(stderr, "Error: -R and -T must be positive hours.\n");
         return 1;
@@ -393,32 +398,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    pw_collector_t collector;
-    memset(&collector, 0, sizeof collector);
-    if (host_collect) collector_init(&collector, schema);
-
     printf("procwatch-agentd: OTLP/HTTP on %s:%d, schema=%s (dynamic labels)%s\n",
            bind_addr, port, schema,
            state.dbbuf.online ? "" : " [offline spill]");
-    printf("procwatch-agentd: retention=%dh inactive=%dh; host scrape %s\n",
-           db_retention_hours(), db_inactive_hours(),
-           host_collect ? "enabled (-A)" : "disabled (inject/wrap push)");
+    printf("procwatch-agentd: retention=%dh inactive=%dh\n",
+           db_retention_hours(), db_inactive_hours());
     fflush(stdout);
 
-    time_t next_tick = time(NULL) + interval;
     time_t next_maintain = time(NULL) + 1;
 
     while (!g_stop) {
+        http_server_tick(&server, 1000);
         time_t now = time(NULL);
-        int timeout_ms = 1000;
-        if (host_collect) {
-            long remaining = (long)(next_tick - now) * 1000;
-            timeout_ms = (remaining > 0) ? (int)remaining : 0;
-            if (timeout_ms > 1000) timeout_ms = 1000;
-        }
-
-        http_server_tick(&server, timeout_ms);
-        now = time(NULL);
 
         if (now >= next_maintain) {
             int was_offline = !state.dbbuf.online;
@@ -428,30 +419,20 @@ int main(int argc, char **argv) {
                 db_ensure_schema(st_conn(&state), schema);
                 db_try_enable_timescaledb(st_conn(&state));
                 db_ensure_drop_inactive_job(st_conn(&state), schema);
-                // Flush again after schema/job setup (maintain may have no-oped
-                // inserts that needed labels first).
                 pw_db_buf_flush(&state.dbbuf, replay_line, &state);
             }
             next_maintain = now + 1;
-        }
-
-        if (host_collect && now >= next_tick) {
-            if (state.dbbuf.online && st_conn(&state) &&
-                PQstatus(st_conn(&state)) == CONNECTION_OK)
-                collector_tick(&collector, st_conn(&state));
-            next_tick = time(NULL) + interval;
         }
     }
 
     pw_db_buf_maintain(&state.dbbuf, replay_line, &state);
 
     printf("procwatch-agentd: shutting down (%llu spans, %llu metrics, "
-           "%llu spilled spans, %llu spilled metrics, %llu host samples)\n",
+           "%llu spilled spans, %llu spilled metrics)\n",
            state.spans_written, state.metrics_written,
-           state.spans_spilled, state.metrics_spilled, collector.samples_written);
+           state.spans_spilled, state.metrics_spilled);
 
     http_server_close(&server);
-    if (host_collect) collector_free(&collector);
     pw_db_buf_close(&state.dbbuf);
     return 0;
 }

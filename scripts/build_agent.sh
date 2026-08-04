@@ -21,9 +21,7 @@ AGENT_SRCS=(
     src/agent/pb_decode.c
     src/agent/otlp_trace.c
     src/agent/db_otlp.c
-    src/agent/collector.c
     src/util.c
-    src/proc_scan.c
     src/db.c
     src/db_buffer.c
 )
@@ -91,6 +89,7 @@ fi
 # -static rebuild from scripts/build_inject_musl.sh for Alpine app images;
 # that step overwrites this glibc-dynamic binary in place.
 "$CC" "${CFLAGS[@]}" src/wrap/wrap.c src/common/proc_push.c \
+    src/proc_scan.c src/util.c \
     -o "$OUTDIR/bin/procwatch-wrap"
 
 # Bundle the transitive closure of shared libs, excluding libc/ld-linux which

@@ -5,11 +5,13 @@
 // LD_PRELOAD library.
 
 #include <sys/types.h>
+#include <time.h>
 
 #define PW_LABEL_MAX 100
 #define PW_PUSH_SERVICE_MAX 256
 #define PW_PUSH_COMM_MAX 64
 #define PW_PUSH_RUNTIME_MAX 32
+#define PW_PID_KEY_MAX 64
 
 typedef struct {
     char label[PW_LABEL_MAX];
@@ -18,6 +20,9 @@ typedef struct {
     char runtime[PW_PUSH_RUNTIME_MAX];
     char pod[PW_PUSH_SERVICE_MAX];
     char container_id[80];
+    // Stable instance id sent to agentd: "<pid>_<YYYYMMDDHHMMSS>" captured
+    // when the sampler starts. Falls back to decimal pid if empty.
+    char pid_key[PW_PID_KEY_MAX];
     int pid;
     double cpu_pct;
     long rss_kb;
@@ -40,6 +45,12 @@ int pw_sample_pid(pid_t pid, pw_proc_baseline_t *base, pw_proc_sample_t *out);
 
 // Fills identity fields from the current process environment / exe.
 void pw_sample_fill_identity(pw_proc_sample_t *out, const char *runtime_hint);
+
+// Formats created_stamp as "_YYYYMMDDHHMMSS" (local time) into out.
+void pw_format_created_stamp(char *out, size_t cap, time_t when);
+
+// Sets out->pid_key to "<pid><stamp>" where stamp is e.g. "_20260804172653".
+void pw_sample_set_pid_key(pw_proc_sample_t *out, int pid, const char *stamp);
 
 // POSTs JSON to {endpoint}/v1/procmetrics. endpoint looks like
 // http://host:port or http://host:port/. Returns 0 on HTTP 2xx.

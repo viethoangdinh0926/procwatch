@@ -147,9 +147,9 @@ Single demo pod
 
 Tables are keyed by each payload’s `PROCWATCH_LABEL` (also attached to OTLP as
 `procwatch.label`). `agentd` does not take `-l`; the first metric or span for a
-label creates `<label>_procs` / `<label>_spans`. The optional hostPID scrape
-(`-A` / `PROCWATCH_HOST_COLLECT`) is off by default so inject/wrap pushes are
-not double-counted.
+label creates `<label>_procs` / `<label>_spans`. Process metrics are pushed by
+the inject metric thread (dynamic ELF) or `procwatch-wrap` (static binaries);
+agentd only receives them over HTTP.
 
 ## How injection works
 
@@ -246,12 +246,10 @@ procwatch-agentd -P 4318 -s procwatch -d "<conn_str>"
 | --- | --- | --- | --- |
 | `-b` | `PROCWATCH_BIND` | `0.0.0.0` | Listen address |
 | `-P` | `PROCWATCH_PORT` | `4318` | OTLP/HTTP + procmetrics port |
-| `-i` | `PROCWATCH_INTERVAL` | `10` | Host-scrape interval when `-A` is set |
 | `-s` | `PROCWATCH_SCHEMA` | `procwatch` | Schema |
 | `-d` | `PROCWATCH_DB` | see `-h` | Connection string |
 | `-R` | `PROCWATCH_RETENTION_HOURS` | `168` | Timescale chunk retention (hours) |
 | `-T` | `PROCWATCH_INACTIVE_HOURS` | `720` | Drop tables with no writes for this many hours |
-| `-A` | `PROCWATCH_HOST_COLLECT` | off | Optional node-wide `/proc` scrape of labeled procs |
 
 ### systemd
 
@@ -326,8 +324,9 @@ the database is back.
 | `status_code`, `status_message` | `TEXT` | `UNSET`/`OK`/`ERROR` |
 | `attributes` | `JSONB` | Full span attributes |
 
-`<schema>.<label>_procs`: `ts`, `service_name`, `container_id`, `pod`, `pid`,
-`comm`, `runtime`, `cpu_pct`, `rss_kb`, `threads`.
+`<schema>.<label>_procs`: `ts`, `service_name`, `container_id`, `pod`, `pid`
+(TEXT series key, typically `<pid>_<YYYYMMDDHHMMSS>` from the inject/wrap
+sampler start), `comm`, `runtime`, `cpu_pct`, `rss_kb`, `threads`.
 
 `service_name` joins the two tables. Spans without `procwatch.label` are
 rejected so unlabeled data cannot land in a mystery table.

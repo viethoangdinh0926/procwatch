@@ -19,7 +19,7 @@ int db_insert_span(PGconn *conn, const pw_span_t *span);
 
 int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label,
                              const char *service, const char *container_id,
-                             const char *pod, int pid, const char *comm,
+                             const char *pod, const char *pid, const char *comm,
                              const char *runtime, double cpu_pct, long rss_kb,
                              long threads);
 

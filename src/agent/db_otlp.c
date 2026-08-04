@@ -150,7 +150,7 @@ static void ensure_metric_table(PGconn *conn, const char *schema, const char *la
              "  service_name TEXT,"
              "  container_id TEXT,"
              "  pod TEXT,"
-             "  pid INTEGER,"
+             "  pid TEXT,"
              "  comm TEXT,"
              "  runtime TEXT,"
              "  cpu_pct DOUBLE PRECISION,"
@@ -166,6 +166,15 @@ static void ensure_metric_table(PGconn *conn, const char *schema, const char *la
         return;
     }
     PQclear(res);
+
+    // Migrate older INTEGER pid columns so "<pid>_<stamp>" keys fit.
+    snprintf(sql, sizeof sql,
+             "DO $$ BEGIN "
+             "  ALTER TABLE %s ALTER COLUMN pid TYPE TEXT USING pid::text; "
+             "EXCEPTION WHEN others THEN NULL; "
+             "END $$;",
+             qualified);
+    exec_warn(conn, sql, "ALTER pid TYPE TEXT");
 
     char idx[80];
     snprintf(idx, sizeof idx, "idx_%s_svc", table);
@@ -218,7 +227,7 @@ static void prepare_metric(PGconn *conn, const char *schema, const char *label,
              "INSERT INTO %s (ts, service_name, container_id, pod, pid, comm,"
              " runtime, cpu_pct, rss_kb, threads)"
              " VALUES (NOW(), $1::text, NULLIF($2::text, ''), NULLIF($3::text, ''),"
-             " $4::int4, $5::text, $6::text, $7::float8, $8::int8, $9::int4);",
+             " $4::text, $5::text, $6::text, $7::float8, $8::int8, $9::int4);",
              qualified);
     PGresult *res = PQprepare(conn, stmt_name, sql, 9, NULL);
     if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -294,7 +303,7 @@ int db_insert_span(PGconn *conn, const pw_span_t *span) {
 
 int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label,
                              const char *service, const char *container_id,
-                             const char *pod, int pid, const char *comm,
+                             const char *pod, const char *pid, const char *comm,
                              const char *runtime, double cpu_pct, long rss_kb,
                              long threads) {
     (void)schema;
@@ -305,15 +314,14 @@ int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label
         return -1;
     }
 
-    char pid_buf[16], cpu_buf[64], rss_buf[32], thr_buf[16];
-    snprintf(pid_buf, sizeof pid_buf, "%d", pid);
+    char cpu_buf[64], rss_buf[32], thr_buf[16];
     snprintf(cpu_buf, sizeof cpu_buf, "%.10g", cpu_pct);
     snprintf(rss_buf, sizeof rss_buf, "%ld", rss_kb);
     snprintf(thr_buf, sizeof thr_buf, "%ld", threads);
 
     const char *vals[9] = {
         service, container_id ? container_id : "", pod ? pod : "",
-        pid_buf, comm, runtime, cpu_buf, rss_buf, thr_buf
+        pid ? pid : "", comm, runtime, cpu_buf, rss_buf, thr_buf
     };
     const int lens[9] = {0};
     const int fmts[9] = {0};

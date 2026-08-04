@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../include/inject.h"
@@ -28,6 +29,11 @@ static void *metrics_loop(void *arg) {
         if (n > 0) interval = n;
     }
 
+    // Capture sampler start once so every sample shares a stable series key
+    // "<pid>_<YYYYMMDDHHMMSS>" for the life of this process/thread.
+    char created_stamp[32];
+    pw_format_created_stamp(created_stamp, sizeof created_stamp, time(NULL));
+
     pw_proc_baseline_t base;
     memset(&base, 0, sizeof base);
 
@@ -45,6 +51,7 @@ static void *metrics_loop(void *arg) {
         memset(&s, 0, sizeof s);
         if (pw_sample_pid(getpid(), &base, &s) != 0) continue;
         pw_sample_fill_identity(&s, runtime);
+        pw_sample_set_pid_key(&s, s.pid, created_stamp);
         if (!pw_label_valid(s.label)) continue;
         if (pw_push_sample(endpoint, &s) != 0)
             pw_debug("metric push failed");

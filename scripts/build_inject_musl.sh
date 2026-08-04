@@ -67,7 +67,7 @@ fi
 mkdir -p "$OUTDIR/bin"
 # Fully static so the same binary works on Alpine (Go samples) and glibc hosts.
 gcc -O2 -Wall -Wextra -Iinclude -static \
-    src/wrap/wrap.c src/common/proc_push.c \
+    src/wrap/wrap.c src/common/proc_push.c src/proc_scan.c src/util.c \
     -o "$OUTDIR/bin/procwatch-wrap"
 
 # Prefer this portable wrap in the primary agent tree as well.

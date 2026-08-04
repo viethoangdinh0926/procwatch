@@ -58,8 +58,8 @@ int http_server_init(pw_http_server_t *srv, const char *bind_addr, int port,
                      pw_http_handler_t handler, void *user_data);
 
 // Services ready sockets for up to timeout_ms. Non-blocking throughout, so a
-// slow or stalled client cannot delay the collector tick that shares this
-// thread. Returns the number of requests dispatched.
+// slow or stalled client cannot delay spill/reconnect maintenance that shares
+// this thread. Returns the number of requests dispatched.
 int http_server_tick(pw_http_server_t *srv, int timeout_ms);
 
 void http_server_close(pw_http_server_t *srv);

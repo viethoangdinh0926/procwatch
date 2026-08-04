@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -133,11 +134,30 @@ int pw_sample_pid(pid_t pid, pw_proc_baseline_t *base, pw_proc_sample_t *out) {
     base->have_baseline = 1;
 
     out->pid = (int)pid;
+    if (!out->pid_key[0])
+        snprintf(out->pid_key, sizeof out->pid_key, "%d", (int)pid);
     snprintf(out->comm, sizeof out->comm, "%s", comm);
     out->cpu_pct = cpu_pct;
     out->rss_kb = rss_kb;
     out->threads = threads;
     return 0;
+}
+
+void pw_format_created_stamp(char *out, size_t cap, time_t when) {
+    if (!out || cap < 2) return;
+    struct tm tm_buf;
+    localtime_r(&when, &tm_buf);
+    // Leading underscore so Grafana/series keys stay "<pid>_<stamp>".
+    strftime(out, cap, "_%Y%m%d%H%M%S", &tm_buf);
+}
+
+void pw_sample_set_pid_key(pw_proc_sample_t *out, int pid, const char *stamp) {
+    if (!out) return;
+    out->pid = pid;
+    if (stamp && *stamp)
+        snprintf(out->pid_key, sizeof out->pid_key, "%d%s", pid, stamp);
+    else
+        snprintf(out->pid_key, sizeof out->pid_key, "%d", pid);
 }
 
 void pw_sample_fill_identity(pw_proc_sample_t *out, const char *runtime_hint) {
@@ -211,11 +231,17 @@ int pw_push_sample(const char *endpoint, const pw_proc_sample_t *s) {
         return -1;
 
     char body[1024];
+    const char *pid_field = (s->pid_key[0]) ? s->pid_key : "";
+    char pid_fallback[32];
+    if (!pid_field[0]) {
+        snprintf(pid_fallback, sizeof pid_fallback, "%d", s->pid);
+        pid_field = pid_fallback;
+    }
     int blen = snprintf(body, sizeof body,
-        "{\"label\":\"%s\",\"service\":\"%s\",\"pid\":%d,\"comm\":\"%s\","
+        "{\"label\":\"%s\",\"service\":\"%s\",\"pid\":\"%s\",\"comm\":\"%s\","
         "\"cpu_pct\":%.6f,\"rss_kb\":%ld,\"threads\":%ld,\"runtime\":\"%s\","
         "\"pod\":\"%s\",\"container_id\":\"%s\"}",
-        s->label, s->service, s->pid, s->comm,
+        s->label, s->service, pid_field, s->comm,
         s->cpu_pct, s->rss_kb, s->threads, s->runtime,
         s->pod, s->container_id);
     if (blen <= 0 || (size_t)blen >= sizeof body) return -1;

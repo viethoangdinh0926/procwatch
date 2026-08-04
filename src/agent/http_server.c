@@ -5,9 +5,8 @@
 // require producers to use it and no official exporter does), no TLS, no
 // static files.
 //
-// The loop is non-blocking and shares its thread with the /proc collector,
-// so a client that opens a connection and stalls cannot delay metric
-// collection.
+// The loop is non-blocking so a client that opens a connection and stalls
+// cannot delay other work on this thread (reconnect/spill maintenance).
 
 #define _GNU_SOURCE
 #include <errno.h>
