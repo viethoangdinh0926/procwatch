@@ -134,8 +134,8 @@ fetch_python_tree() {
         -e PW_UID="$HOST_UID" -e PW_GID="$HOST_GID" \
         -v "$(pwd)/$target:/out" "$image" /bin/sh -c '
         set -e
-        pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-        pip install --quiet --target /out $PW_PKGS
+        pip install --quiet --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org >/dev/null 2>&1 || true
+        pip install --quiet --target /out --trusted-host pypi.org --trusted-host files.pythonhosted.org $PW_PKGS
         chmod -R go+rX /out
         chown -R "$PW_UID:$PW_GID" /out
     '
