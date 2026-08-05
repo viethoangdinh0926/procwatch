@@ -43,7 +43,11 @@ typedef struct {
     unsigned long long spans_spilled;
     unsigned long long metrics_written;
     unsigned long long metrics_spilled;
+    unsigned long long otel_metrics_written;
+    unsigned long long otel_metrics_dropped;
+    unsigned long long otel_metrics_spilled;
     unsigned long long payloads_traces;
+    unsigned long long payloads_metrics;
     unsigned long long payloads_procmetrics;
     unsigned long long payloads_other;
 } agent_state_t;
@@ -136,6 +140,43 @@ static int write_metric(agent_state_t *st, const char *label, const char *servic
     return 0; // accepted into spill
 }
 
+static int write_otel_metric(agent_state_t *st, const pw_metric_point_t *point) {
+    if (st->dbbuf.online && st_conn(st) &&
+        db_ensure_label(st_conn(st), st->schema, point->label) == 0 &&
+        db_insert_otel_metric(st_conn(st), point) == 0) {
+        ++st->otel_metrics_written;
+        return 0;
+    }
+    mark_offline(st);
+
+    char elabel[200], esvc[512], escope[512], epid[160], ename[512], etype[32];
+    char edesc[512], eunit[128], eattr[2200];
+    pw_json_escape(elabel, sizeof elabel, point->label);
+    pw_json_escape(esvc, sizeof esvc, point->service_name);
+    pw_json_escape(escope, sizeof escope, point->scope_name);
+    pw_json_escape(epid, sizeof epid, point->pid_key);
+    pw_json_escape(ename, sizeof ename, point->metric_name);
+    pw_json_escape(etype, sizeof etype, point->metric_type ? point->metric_type : "gauge");
+    pw_json_escape(edesc, sizeof edesc, point->description);
+    pw_json_escape(eunit, sizeof eunit, point->unit);
+    pw_json_escape(eattr, sizeof eattr,
+                   point->attributes_json[0] ? point->attributes_json : "{}");
+
+    char ts_buf[64];
+    snprintf(ts_buf, sizeof ts_buf, "%.9f", (double)point->time_ns / 1e9);
+
+    char line[8192];
+    snprintf(line, sizeof line,
+             "{\"k\":\"otelmetric\",\"schema\":\"%s\",\"label\":\"%s\",\"ts\":\"%s\","
+             "\"service_name\":\"%s\",\"scope_name\":\"%s\",\"pid\":\"%s\","
+             "\"metric_name\":\"%s\",\"metric_type\":\"%s\",\"description\":\"%s\","
+             "\"unit\":\"%s\",\"value\":%.17g,\"count\":%lld,\"attributes\":\"%s\"}",
+             st->schema, elabel, ts_buf, esvc, escope, epid, ename, etype, edesc, eunit,
+             point->value, (long long)point->count, eattr);
+    if (pw_db_buf_spill(&st->dbbuf, line) == 0) ++st->otel_metrics_spilled;
+    return 0; // accepted into spill
+}
+
 static int write_span(agent_state_t *st, const pw_span_t *span) {
     if (st->dbbuf.online && st_conn(st) &&
         db_ensure_label(st_conn(st), st->schema, span->label) == 0 &&
@@ -218,12 +259,31 @@ static int span_sink(const pw_span_t *span, void *user_data) {
     return write_span(st, span);
 }
 
+static int otel_metric_sink(const pw_metric_point_t *point, void *user_data) {
+    agent_state_t *st = (agent_state_t *)user_data;
+    if (!point->label[0] || !validate_identifier(point->label)) {
+        ++st->otel_metrics_dropped;
+        return 0;
+    }
+    return write_otel_metric(st, point);
+}
+
 static int on_request(const pw_http_request_t *req, void *user_data) {
     agent_state_t *st = (agent_state_t *)user_data;
 
     if (req->signal == PW_SIGNAL_PROCMETRICS) {
         ++st->payloads_procmetrics;
         return handle_procmetrics(st, req->body, req->body_len);
+    }
+
+    if (req->signal == PW_SIGNAL_METRICS) {
+        ++st->payloads_metrics;
+        int n = otlp_decode_metrics(req->body, req->body_len, otel_metric_sink, st);
+        if (n < 0) {
+            fprintf(stderr, "malformed OTLP metrics payload (%zu bytes)\n", req->body_len);
+            return -1;
+        }
+        return 0;
     }
 
     if (req->signal != PW_SIGNAL_TRACES) {
@@ -305,6 +365,36 @@ static int replay_line(const char *line, size_t len, void *user) {
         ++st->spans_written;
         return 0;
     }
+
+    if (strncmp(line, "{\"k\":\"otelmetric\"", 18) == 0) {
+        pw_metric_point_t point;
+        memset(&point, 0, sizeof point);
+        char type_buf[PW_METRIC_TYPE_MAX] = "gauge", ts_buf[64] = "";
+        double value = 0, count = 1;
+        if (json_str(line, len, "label", point.label, sizeof point.label) != 0) return 0;
+        if (!validate_identifier(point.label)) return 0;
+        json_str(line, len, "service_name", point.service_name, sizeof point.service_name);
+        json_str(line, len, "scope_name", point.scope_name, sizeof point.scope_name);
+        json_str(line, len, "pid", point.pid_key, sizeof point.pid_key);
+        json_str(line, len, "metric_name", point.metric_name, sizeof point.metric_name);
+        json_str(line, len, "metric_type", type_buf, sizeof type_buf);
+        json_str(line, len, "description", point.description, sizeof point.description);
+        json_str(line, len, "unit", point.unit, sizeof point.unit);
+        json_str(line, len, "attributes", point.attributes_json, sizeof point.attributes_json);
+        json_str(line, len, "ts", ts_buf, sizeof ts_buf);
+        if (!point.attributes_json[0])
+            snprintf(point.attributes_json, sizeof point.attributes_json, "{}");
+        json_num(line, len, "value", &value);
+        json_num(line, len, "count", &count);
+        point.metric_type = type_buf;
+        point.value = value;
+        point.count = (int64_t)count;
+        point.time_ns = (uint64_t)((ts_buf[0] ? strtod(ts_buf, NULL) : 0) * 1e9);
+        if (db_ensure_label(st_conn(st), st->schema, point.label) != 0) return -1;
+        if (db_insert_otel_metric(st_conn(st), &point) != 0) return -1;
+        ++st->otel_metrics_written;
+        return 0;
+    }
     return 0; // skip unknown
 }
 
@@ -320,9 +410,11 @@ static void usage(const char *argv0) {
         "  -R <hours>    Timescale chunk retention (default %d, env PROCWATCH_RETENTION_HOURS)\n"
         "  -T <hours>    Drop tables idle longer than this (default %d, env PROCWATCH_INACTIVE_HOURS)\n"
         "\n"
-        "Tables are named <label>_spans / <label>_procs from each payload's\n"
-        "PROCWATCH_LABEL / procwatch.label; no -l flag is required.\n"
+        "Tables are named <label>_spans / <label>_procs / <label>_otel_metrics from\n"
+        "each payload's PROCWATCH_LABEL / procwatch.label; no -l flag is required.\n"
         "Process metrics are pushed by inject threads / procwatch-wrap.\n"
+        "OTLP metrics (POST /v1/metrics) from the Java/Python SDKs land in\n"
+        "<label>_otel_metrics, one row per data point.\n"
         "If the database is unreachable, data is spilled under PROCWATCH_SPILL_DIR\n"
         "(default /var/tmp/procwatch) and flushed on reconnect.\n",
         argv0, PW_DEFAULT_RETENTION_HOURS, PW_DEFAULT_INACTIVE_HOURS);
@@ -427,10 +519,11 @@ int main(int argc, char **argv) {
 
     pw_db_buf_maintain(&state.dbbuf, replay_line, &state);
 
-    printf("procwatch-agentd: shutting down (%llu spans, %llu metrics, "
-           "%llu spilled spans, %llu spilled metrics)\n",
-           state.spans_written, state.metrics_written,
-           state.spans_spilled, state.metrics_spilled);
+    printf("procwatch-agentd: shutting down (%llu spans, %llu proc metrics, "
+           "%llu otel metrics, %llu spilled spans, %llu spilled proc metrics, "
+           "%llu spilled otel metrics)\n",
+           state.spans_written, state.metrics_written, state.otel_metrics_written,
+           state.spans_spilled, state.metrics_spilled, state.otel_metrics_spilled);
 
     http_server_close(&server);
     pw_db_buf_close(&state.dbbuf);

@@ -19,7 +19,9 @@ AGENT_SRCS=(
     src/agent/agentd.c
     src/agent/http_server.c
     src/agent/pb_decode.c
+    src/agent/otlp_common.c
     src/agent/otlp_trace.c
+    src/agent/otlp_metric.c
     src/agent/db_otlp.c
     src/util.c
     src/db.c

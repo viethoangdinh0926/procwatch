@@ -7,6 +7,6 @@
 #   PYTHON_VERSIONS="3.11" make runtimes
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir flask==3.0.3
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org flask==3.0.3
 COPY python/app.py .
 CMD ["python", "app.py"]

@@ -1,6 +1,12 @@
 // libprocwatch_inject.so - LD_PRELOAD auto-instrumentation decider + metric
 // thread bootstrap.
 //
+// The metric thread (metrics_thread.c) starts for every process that loads
+// this library and carries a valid PROCWATCH_LABEL, independent of runtime:
+// it needs no OTel SDK. OTel bootstrap itself (env vars, -javaagent,
+// PYTHONPATH shim) stays gated on detecting Java/Python, since that part is
+// genuinely runtime-specific.
+//
 // Constraints that must not be relaxed:
 //   - No undefined symbols (--no-undefined). A preloaded object that loads
 //     but cannot resolve a symbol aborts the process on both glibc and musl.
@@ -15,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/auxv.h>
 
@@ -75,6 +82,77 @@ void pw_attach_label_to_otel(const char *label) {
     setenv("OTEL_RESOURCE_ATTRIBUTES", buf, 1);
 }
 
+// Sets `key=value` inside OTEL_RESOURCE_ATTRIBUTES, replacing any existing
+// occurrence of `key` rather than leaving a stale one behind. Unlike
+// pw_attach_label_to_otel above (whose value cannot change across a re-exec
+// of the same process, so skipping when already present is correct),
+// procwatch.pid_key embeds the pid: a genuinely new child process that
+// merely inherited the parent's environment would otherwise keep reporting
+// the parent's pid forever.
+static void set_resource_attr(const char *key, const char *value) {
+    char kv[192];
+    if ((size_t)snprintf(kv, sizeof kv, "%s=%s", key, value) >= sizeof kv) return;
+    char keyeq[160];
+    if ((size_t)snprintf(keyeq, sizeof keyeq, "%s=", key) >= sizeof keyeq) return;
+    size_t keyeq_len = strlen(keyeq);
+
+    const char *cur = getenv("OTEL_RESOURCE_ATTRIBUTES");
+    if (!cur || !*cur) {
+        setenv("OTEL_RESOURCE_ATTRIBUTES", kv, 1);
+        return;
+    }
+
+    char buf[8192];
+    size_t blen = 0;
+    int replaced = 0;
+    const char *p = cur;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t seg_len = comma ? (size_t)(comma - p) : strlen(p);
+        int is_target = seg_len >= keyeq_len && strncmp(p, keyeq, keyeq_len) == 0;
+        const char *out_seg = is_target ? kv : p;
+        size_t out_len = is_target ? strlen(kv) : seg_len;
+        if (is_target) replaced = 1;
+
+        if (blen) {
+            if (blen + 1 >= sizeof buf) return; // would overflow; leave as-is
+            buf[blen++] = ',';
+        }
+        if (blen + out_len >= sizeof buf) return;
+        memcpy(buf + blen, out_seg, out_len);
+        blen += out_len;
+
+        if (!comma) break;
+        p = comma + 1;
+    }
+
+    if (!replaced) {
+        if (blen) {
+            if (blen + 1 >= sizeof buf) return;
+            buf[blen++] = ',';
+        }
+        size_t kvlen = strlen(kv);
+        if (blen + kvlen >= sizeof buf) return;
+        memcpy(buf + blen, kv, kvlen);
+        blen += kvlen;
+    }
+    buf[blen] = '\0';
+    setenv("OTEL_RESOURCE_ATTRIBUTES", buf, 1);
+}
+
+// Attaches procwatch.pid_key=<pid>_<YYYYMMDDHHMMSS> to OTEL_RESOURCE_ATTRIBUTES,
+// the same "<pid>_<start stamp>" series key convention used for the pid
+// column in <label>_procs, so OTLP metrics in <label>_otel_metrics can be
+// correlated back to a specific process instance rather than just a pid
+// that may have been reused.
+static void pw_attach_pid_key_to_otel(void) {
+    char stamp[32];
+    pw_format_created_stamp(stamp, sizeof stamp, time(NULL));
+    char pid_key[64];
+    snprintf(pid_key, sizeof pid_key, "%d%s", (int)getpid(), stamp);
+    set_resource_attr("procwatch.pid_key", pid_key);
+}
+
 static int path_exists(const char *path) {
     return access(path, F_OK) == 0;
 }
@@ -98,6 +176,7 @@ static const char *resolve_service_name(void) {
 void pw_apply_common(void) {
     const char *label = pw_resolve_label();
     if (label) pw_attach_label_to_otel(label);
+    pw_attach_pid_key_to_otel();
 
     const char *service = resolve_service_name();
     pw_env_set_default("OTEL_SERVICE_NAME", service);
@@ -124,6 +203,13 @@ void pw_apply_java(const char *agent_dir) {
     snprintf(opt, sizeof opt, " -javaagent:%s", jar);
     if (pw_env_append("JAVA_TOOL_OPTIONS", opt, jar) == 0)
         pw_debug("injected java agent %s", jar);
+
+    // The javaagent bundles JVM runtime metrics (heap/non-heap memory, GC,
+    // threads, classes, CPU) gated behind this flag. It ships enabled by
+    // default on recent agent versions, but set it explicitly so procwatch's
+    // OTLP metrics table gets the same JVM coverage regardless of agent
+    // version pinned into java/javaagent.jar.
+    pw_env_set_default("OTEL_INSTRUMENTATION_RUNTIME_TELEMETRY_ENABLED", "true");
 }
 
 void pw_apply_python(const char *agent_dir) {
@@ -163,11 +249,17 @@ static void pw_init(void) {
         return;
     }
 
-    pw_runtime_t rt = pw_detect_by_name();
-    if (rt == PW_RT_UNKNOWN) return;
+    // The metric thread (started from __libc_start_main, see
+    // metrics_thread.c) samples /proc/self and is useful for any process
+    // that loads this library and carries a valid label, regardless of
+    // runtime: process-level CPU/RSS/thread sampling doesn't depend on an
+    // OTel SDK being present. Arm it unconditionally here; only the OTel
+    // bootstrap below (env vars, -javaagent, PYTHONPATH shim) stays
+    // Java/Python-specific, since that's genuinely runtime-dependent.
+    pw_set_injection_armed(1);
 
-    rt = pw_confirm_by_symbol(rt);
-    if (rt == PW_RT_UNKNOWN) return;
+    pw_runtime_t rt = pw_detect_by_name();
+    if (rt != PW_RT_UNKNOWN) rt = pw_confirm_by_symbol(rt);
 
     const char *agent_dir = pw_agent_dir();
 
@@ -176,15 +268,14 @@ static void pw_init(void) {
             pw_apply_common();
             pw_apply_java(agent_dir);
             pw_set_runtime_hint("java");
-            pw_set_injection_armed(1);
             break;
         case PW_RT_PYTHON:
             pw_apply_common();
             pw_apply_python(agent_dir);
             pw_set_runtime_hint("python");
-            pw_set_injection_armed(1);
             break;
         default:
+            pw_set_runtime_hint("other");
             break;
     }
 }

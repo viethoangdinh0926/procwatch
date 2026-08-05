@@ -80,6 +80,7 @@ services:
       PROCWATCH_INJECT_DEBUG: "1"
       OTEL_SERVICE_NAME: payments
       OTEL_BSP_SCHEDULE_DELAY: "2000"
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"
 
   go-app:
     build:

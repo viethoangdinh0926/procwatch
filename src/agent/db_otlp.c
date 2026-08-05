@@ -18,6 +18,7 @@ typedef struct {
     char label[100];
     char span_stmt[STMT_NAME_MAX];
     char metric_stmt[STMT_NAME_MAX];
+    char otel_metric_stmt[STMT_NAME_MAX];
     int ready;
 } label_entry_t;
 
@@ -197,6 +198,81 @@ static void ensure_metric_table(PGconn *conn, const char *schema, const char *la
     }
 }
 
+static void ensure_otel_metric_table(PGconn *conn, const char *schema, const char *label) {
+    char table[80];
+    suffixed_name(table, sizeof table, label, "_otel_metrics");
+    int existed_before = db_table_exists(conn, schema, table);
+
+    db_ensure_schema(conn, schema);
+    db_try_enable_timescaledb(conn);
+
+    char *qualified = db_make_qualified(conn, schema, table);
+    char sql[2048];
+    snprintf(sql, sizeof sql,
+             "CREATE TABLE IF NOT EXISTS %s ("
+             "  ts TIMESTAMPTZ NOT NULL,"
+             "  service_name TEXT,"
+             "  scope_name TEXT,"
+             // TEXT, "<pid>_<YYYYMMDDHHMMSS>": same series-key convention as
+             // the pid column in <label>_procs, so a given process instance
+             // can be correlated across both tables and pid reuse doesn't
+             // alias two different processes together.
+             "  pid TEXT,"
+             "  metric_name TEXT NOT NULL,"
+             "  metric_type TEXT,"
+             "  description TEXT,"
+             "  unit TEXT,"
+             "  value DOUBLE PRECISION,"
+             "  count BIGINT,"
+             "  attributes JSONB"
+             ");",
+             qualified);
+    PGresult *res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "CREATE otel metric table failed: %s\n", PQerrorMessage(conn));
+        PQclear(res);
+        free(qualified);
+        return;
+    }
+    PQclear(res);
+
+    // Migrate tables created before the pid column existed.
+    snprintf(sql, sizeof sql,
+             "ALTER TABLE %s ADD COLUMN IF NOT EXISTS pid TEXT;",
+             qualified);
+    exec_warn(conn, sql, "ALTER ADD COLUMN pid");
+
+    char idx[80];
+    snprintf(idx, sizeof idx, "idx_%s_name", table);
+    idx[63] = '\0';
+    char *esc_idx = PQescapeIdentifier(conn, idx, strlen(idx));
+    if (esc_idx) {
+        snprintf(sql, sizeof sql,
+                 "CREATE INDEX IF NOT EXISTS %s ON %s (metric_name, ts DESC);",
+                 esc_idx, qualified);
+        exec_warn(conn, sql, "CREATE INDEX");
+        PQfreemem(esc_idx);
+    }
+    snprintf(idx, sizeof idx, "idx_%s_svc", table);
+    idx[63] = '\0';
+    esc_idx = PQescapeIdentifier(conn, idx, strlen(idx));
+    if (esc_idx) {
+        snprintf(sql, sizeof sql,
+                 "CREATE INDEX IF NOT EXISTS %s ON %s (service_name, ts DESC);",
+                 esc_idx, qualified);
+        exec_warn(conn, sql, "CREATE INDEX");
+        PQfreemem(esc_idx);
+    }
+    free(qualified);
+    hypertable_and_retention(conn, schema, table);
+
+    if (!existed_before && db_table_exists(conn, schema, table)) {
+        db_ensure_tracker_objects(conn, schema);
+        db_register_new_table_in_tracker(conn, schema, table);
+        db_create_activity_triggers_for_table(conn, schema, table);
+    }
+}
+
 static void prepare_span(PGconn *conn, const char *schema, const char *label,
                          const char *stmt_name) {
     char table[80];
@@ -236,6 +312,26 @@ static void prepare_metric(PGconn *conn, const char *schema, const char *label,
     free(qualified);
 }
 
+static void prepare_otel_metric(PGconn *conn, const char *schema, const char *label,
+                                const char *stmt_name) {
+    char table[80];
+    suffixed_name(table, sizeof table, label, "_otel_metrics");
+    char *qualified = db_make_qualified(conn, schema, table);
+    char sql[1024];
+    snprintf(sql, sizeof sql,
+             "INSERT INTO %s (ts, service_name, scope_name, pid, metric_name,"
+             " metric_type, description, unit, value, count, attributes)"
+             " VALUES (to_timestamp($1::float8), $2::text, $3::text,"
+             " NULLIF($4::text, ''), $5::text, $6::text, NULLIF($7::text, ''),"
+             " NULLIF($8::text, ''), $9::float8, $10::int8, $11::jsonb);",
+             qualified);
+    PGresult *res = PQprepare(conn, stmt_name, sql, 11, NULL);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+        fprintf(stderr, "PQprepare otel metric insert failed: %s\n", PQerrorMessage(conn));
+    PQclear(res);
+    free(qualified);
+}
+
 static label_entry_t *find_label(const char *label) {
     for (size_t i = 0; i < g_label_count; ++i) {
         if (strcmp(g_labels[i].label, label) == 0) return &g_labels[i];
@@ -261,12 +357,15 @@ int db_ensure_label(PGconn *conn, const char *schema, const char *label) {
         // Prepared statement names must be unique and identifier-safe.
         snprintf(e->span_stmt, sizeof e->span_stmt, "pw_span_%s", label);
         snprintf(e->metric_stmt, sizeof e->metric_stmt, "pw_metric_%s", label);
+        snprintf(e->otel_metric_stmt, sizeof e->otel_metric_stmt, "pw_otelm_%s", label);
     }
 
     ensure_span_table(conn, schema, label);
     ensure_metric_table(conn, schema, label);
+    ensure_otel_metric_table(conn, schema, label);
     prepare_span(conn, schema, label, e->span_stmt);
     prepare_metric(conn, schema, label, e->metric_stmt);
+    prepare_otel_metric(conn, schema, label, e->otel_metric_stmt);
     e->ready = 1;
     return 0;
 }
@@ -329,6 +428,35 @@ int db_insert_metric_labeled(PGconn *conn, const char *schema, const char *label
     PGresult *res = PQexecPrepared(conn, e->metric_stmt, 9, vals, lens, fmts, 0);
     int ok = PQresultStatus(res) == PGRES_COMMAND_OK;
     if (!ok) fprintf(stderr, "metric insert failed: %s", PQerrorMessage(conn));
+    PQclear(res);
+    return ok ? 0 : -1;
+}
+
+int db_insert_otel_metric(PGconn *conn, const pw_metric_point_t *point) {
+    if (!conn || PQstatus(conn) != CONNECTION_OK) return -1;
+    label_entry_t *e = find_label(point->label);
+    if (!e || !e->ready) {
+        fprintf(stderr, "otel metric insert: label %s not prepared\n", point->label);
+        return -1;
+    }
+
+    char ts_buf[64], value_buf[64], count_buf[32];
+    snprintf(ts_buf, sizeof ts_buf, "%.9f", (double)point->time_ns / 1e9);
+    snprintf(value_buf, sizeof value_buf, "%.17g", point->value);
+    snprintf(count_buf, sizeof count_buf, "%lld", (long long)point->count);
+
+    const char *vals[11] = {
+        ts_buf, point->service_name, point->scope_name, point->pid_key,
+        point->metric_name, point->metric_type ? point->metric_type : "gauge",
+        point->description, point->unit, value_buf, count_buf,
+        point->attributes_json[0] ? point->attributes_json : "{}",
+    };
+    const int lens[11] = {0};
+    const int fmts[11] = {0};
+
+    PGresult *res = PQexecPrepared(conn, e->otel_metric_stmt, 11, vals, lens, fmts, 0);
+    int ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+    if (!ok) fprintf(stderr, "otel metric insert failed: %s", PQerrorMessage(conn));
     PQclear(res);
     return ok ? 0 : -1;
 }

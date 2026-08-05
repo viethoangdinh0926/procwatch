@@ -126,46 +126,93 @@ targets.
 
 | Artifact | Role |
 | --- | --- |
-| `libprocwatch_inject.so` | `LD_PRELOAD` library: runtime env bootstrap, OTEL label attachment, metric pthread, execve env maintenance. |
+| `libprocwatch_inject.so` | `LD_PRELOAD` library: runtime env bootstrap, OTEL label attachment, metric pthread (any process, not just Java/Python), execve env maintenance. |
 | `procwatch-wrap` | Parent sampler for static binaries (e.g. Go): fork/exec the app, sample `/proc/<child>`, POST the same JSON. |
-| `procwatch-agentd` | Receives OTLP/HTTP and `POST /v1/procmetrics`; creates `<label>_spans` / `<label>_procs` on first sight. |
+| `procwatch-agentd` | Receives OTLP/HTTP and `POST /v1/procmetrics`; creates `<label>_spans` / `<label>_procs` / `<label>_otel_metrics` on first sight. |
 | `java/javaagent.jar` | Upstream OpenTelemetry Java agent, loaded via `-javaagent`. |
 | `python/` | `sitecustomize.py` shim plus per-ABI vendored OpenTelemetry packages. |
 
 ```
 Single demo pod
-┌────────────────────────────────────────┐
-│ agentd :4318                           │──▶ TimescaleDB
-│   OTLP /v1/traces + /v1/procmetrics    │
-│                                        │
-│ checkout (Java)  LD_PRELOAD ──OTLP/JSON▶│
-│ payments (Python) LD_PRELOAD ─OTLP/JSON▶│
-│ inventory (Go)   procwatch-wrap ─JSON──▶│
-└────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ agentd :4318                                 │──▶ TimescaleDB
+│   OTLP /v1/traces + /v1/metrics + /v1/procmetrics │
+│                                              │
+│ checkout (Java)  LD_PRELOAD ──OTLP/JSON────▶│
+│ payments (Python) LD_PRELOAD ─OTLP/JSON────▶│
+│ inventory (Go)   procwatch-wrap ─JSON──────▶│
+└──────────────────────────────────────────────┘
          (127.0.0.1 shared netns)
 ```
 
 Tables are keyed by each payload’s `PROCWATCH_LABEL` (also attached to OTLP as
-`procwatch.label`). `agentd` does not take `-l`; the first metric or span for a
-label creates `<label>_procs` / `<label>_spans`. Process metrics are pushed by
-the inject metric thread (dynamic ELF) or `procwatch-wrap` (static binaries);
-agentd only receives them over HTTP.
+`procwatch.label`). `agentd` does not take `-l`; the first payload for a label
+creates `<label>_procs` / `<label>_spans` / `<label>_otel_metrics`. Process
+metrics (`_procs`) are pushed by the inject metric thread or `procwatch-wrap`
+as plain JSON over `/v1/procmetrics`. The inject metric thread starts for
+*any* dynamically linked process that loads the injector and carries a valid
+`PROCWATCH_LABEL`, regardless of runtime — it needs no OTel SDK, so it also
+covers processes the runtime detector doesn't recognize as Java/Python.
+`procwatch-wrap` remains the only option for statically linked binaries
+(e.g. Go with `CGO_ENABLED=0`), since those never load `LD_PRELOAD` objects
+at all. OTLP metrics (`_otel_metrics`) come from the Java/Python OpenTelemetry
+SDKs over standard `/v1/metrics`, one row per decoded data point (Gauge and
+Sum points keep their instantaneous value; Histogram points are flattened to
+their count + sum, individual buckets are dropped). `agentd` only receives
+data over HTTP in both cases.
+
+### `_procs` vs `_otel_metrics`: which one has what
+
+Both auto-instrumentation runtimes now emit metrics that overlap with what
+`_procs` already covers (CPU%, RSS, thread count), plus signals `_procs`
+does not:
+
+| Metric | `_procs` (procwatch sampling) | `_otel_metrics` (OTLP SDK) |
+| --- | --- | --- |
+| CPU usage | `cpu_pct`, from `/proc` deltas, all runtimes incl. Go | `process.cpu.percent` (Python) / JVM CPU (Java), same "percent of one core" convention |
+| Memory (RSS) | `rss_kb` | `process.resident_memory.bytes` (Python) / JVM heap+non-heap (Java) |
+| Threads | `threads` | `process.threads` (Python) / JVM thread count (Java) |
+| Process instance key | `pid`, `"<pid>_<YYYYMMDDHHMMSS>"` | `pid`, same `"<pid>_<YYYYMMDDHHMMSS>"` format, from the `procwatch.pid_key` resource attribute the injector attaches |
+| Virtual memory, open fds, GC stats, interpreter/JVM info | not collected | `process.virtual_memory.bytes`, `process.open_fds`, `python.gc.*` / JVM GC metrics, `python.info` |
+| Works for static Go binaries | Yes, via `procwatch-wrap` | No; no OTel SDK in the binary |
+
+`_procs` remains the language-agnostic baseline (including Go, C, or any
+static binary with no OTel SDK); `_otel_metrics` adds richer, SDK-native
+signals for Java and Python specifically, on the same OTLP metrics pipeline
+already used for traces. Java's JVM runtime metrics (memory, GC, threads,
+CPU) are emitted automatically by the upstream javaagent — no code change
+needed beyond `OTEL_INSTRUMENTATION_RUNTIME_TELEMETRY_ENABLED=true`, which
+the injector sets by default. Python's process metrics are registered
+explicitly in `runtime/python/sitecustomize.py` after auto-instrumentation
+initializes, using the same `opentelemetry.metrics` meter the vendored SDK
+already ships.
 
 ## How injection works
 
 Requires a valid `PROCWATCH_LABEL` (`^[A-Za-z0-9_]+$`). Without it the injector
-skips OTEL bootstrap and the metric thread.
+skips OTEL bootstrap and the metric thread. The metric thread itself is
+armed for every process that reaches this point, independent of runtime
+detection; only the OTEL env bootstrap (`-javaagent`, `PYTHONPATH` shim, and
+the `procwatch.pid_key` resource attribute described below) stays gated on
+detecting Java/Python, since that part is genuinely runtime-specific.
 
 The ELF constructor (before `main`):
 
 1. Checks the kill switch `PROCWATCH_INJECT_DISABLED=1`.
-2. Rejects unknown executable basenames via `getauxval(AT_EXECFN)`.
-3. Confirms the runtime with `dlsym` (`JLI_Launch` / `Py_BytesMain`).
-4. Rewrites the environment idempotently and appends
-   `procwatch.label=<label>` to `OTEL_RESOURCE_ATTRIBUTES`.
+2. Checks `PROCWATCH_LABEL` is present and valid; arms the metric thread if so.
+3. Detects the runtime by executable basename (`getauxval(AT_EXECFN)`), then
+   confirms it with `dlsym` (`JLI_Launch` / `Py_BytesMain`). Unrecognized
+   executables fall through as runtime `"other"` — the metric thread still
+   runs for them, only the OTEL bootstrap below is skipped.
+4. For Java/Python only: rewrites the environment idempotently, appends
+   `procwatch.label=<label>` to `OTEL_RESOURCE_ATTRIBUTES`, and sets
+   `procwatch.pid_key=<pid>_<YYYYMMDDHHMMSS>` there too (replacing any stale
+   value inherited from a parent process, since a genuinely new child has
+   its own pid).
 
 Separately, `__libc_start_main` is interposed so a detached metric pthread
-starts *after* the loader lock and *before* application `main`. The thread
+starts *after* the loader lock and *before* application `main`, for any
+process that armed it in step 2 above — independent of runtime. The thread
 samples `/proc/self` every `PROCWATCH_METRIC_INTERVAL` (default 10s) and POSTs
 JSON to `{PROCWATCH_ENDPOINT}/v1/procmetrics` over raw sockets (no libcurl).
 
@@ -178,18 +225,20 @@ more than once per `java` invocation.
 
 ## Runtime support and limits
 
-| Runtime | Traces | Process metrics | Notes |
-| --- | --- | --- | --- |
-| Java 8+ | Yes | Yes (inject thread) | Upstream OpenTelemetry Java agent. |
-| CPython 3.x | Yes | Yes (inject thread) | Vendored tree must match interpreter minor + libc. |
-| Static Go | **No** | Yes (`procwatch-wrap`) | No `PT_INTERP`; wrap is required. |
+| Runtime | Traces | Process metrics (`_procs`) | OTLP metrics (`_otel_metrics`) | Notes |
+| --- | --- | --- | --- | --- |
+| Java 8+ | Yes | Yes (inject thread) | Yes (JVM runtime metrics, built into the javaagent) | Upstream OpenTelemetry Java agent. |
+| CPython 3.x | Yes | Yes (inject thread) | Yes (registered in `sitecustomize.py`) | Vendored tree must match interpreter minor + libc. |
+| Other dynamically linked binaries (Node.js, Ruby, C/C++, dynamic Go, …) | No | Yes (inject thread) | No | Not runtime-detected, so no OTEL bootstrap; the metric thread still starts as long as the binary loads `LD_PRELOAD` and has a valid `PROCWATCH_LABEL`. |
+| Static Go (`CGO_ENABLED=0`) | **No** | Yes (`procwatch-wrap`) | **No** | No `PT_INTERP`; the injector can never load, so `procwatch-wrap` is required regardless of the row above. |
 
-**Static Go cannot get an in-process metric thread via `LD_PRELOAD`.** There is
-no dynamic linker, so the injector never loads. Use
+**Statically linked binaries cannot get the in-process metric thread via
+`LD_PRELOAD`.** There is no dynamic linker, so the injector never loads —
+this applies no matter how permissive runtime detection is. Use
 `command: ["/opt/procwatch/agent/bin/procwatch-wrap", "--", "<app>", …]` with
-the same `PROCWATCH_LABEL` / `PROCWATCH_ENDPOINT`. For Go traces, use the
-OpenTelemetry Go SDK in-app or a privileged eBPF agent; both are out of scope
-here.
+the same `PROCWATCH_LABEL` / `PROCWATCH_ENDPOINT`. For traces from such a
+binary, use the OpenTelemetry SDK in-app or a privileged eBPF agent; both are
+out of scope here.
 
 Other cases deliberately not handled:
 
@@ -328,7 +377,14 @@ the database is back.
 (TEXT series key, typically `<pid>_<YYYYMMDDHHMMSS>` from the inject/wrap
 sampler start), `comm`, `runtime`, `cpu_pct`, `rss_kb`, `threads`.
 
-`service_name` joins the two tables. Spans without `procwatch.label` are
+`<schema>.<label>_otel_metrics`: `ts`, `service_name`, `scope_name`, `pid`
+(TEXT series key, same `<pid>_<YYYYMMDDHHMMSS>` format as `_procs`, from the
+`procwatch.pid_key` resource attribute; empty if the SDK's resource lacked
+one), `metric_name`, `metric_type` (`gauge`/`sum`/`histogram`), `description`,
+`unit`, `value` (instantaneous value, or sum for histograms), `count`
+(histogram point count; `1` for gauge/sum), `attributes` (`JSONB`).
+
+`service_name` joins all three tables. Spans without `procwatch.label` are
 rejected so unlabeled data cannot land in a mystery table.
 ## Grafana queries for traces
 
