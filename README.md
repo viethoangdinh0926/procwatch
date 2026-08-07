@@ -132,18 +132,43 @@ targets.
 | `java/javaagent.jar` | Upstream OpenTelemetry Java agent, loaded via `-javaagent`. |
 | `python/` | `sitecustomize.py` shim plus per-ABI vendored OpenTelemetry packages. |
 
+### Architecture
+
+```mermaid
+flowchart LR
+  subgraph clients [Client_apps]
+    Java["Java_LD_PRELOAD\ncheckout"]
+    Python["Python_LD_PRELOAD\npayments"]
+    Go["Go_procwatch_wrap\ninventory"]
+  end
+
+  Agentd["procwatch_agentd\n:4318"]
+
+  subgraph backends [Storage_and_backends]
+    TS[(TimescaleDB)]
+    Tempo[Tempo]
+    Prom[Prometheus]
+  end
+
+  Grafana[Grafana]
+
+  Java -->|"OTLP_/v1/traces\nOTLP_/v1/metrics\nJSON_/v1/procmetrics"| Agentd
+  Python -->|"OTLP_/v1/traces\nOTLP_/v1/metrics\nJSON_/v1/procmetrics"| Agentd
+  Go -->|"JSON_/v1/procmetrics\nprocess_tree"| Agentd
+
+  Agentd -->|"authoritative\n_spans_procs_otel_metrics"| TS
+  Agentd -.->|"optional_best_effort\n/v1/traces"| Tempo
+  Agentd -.->|"optional_best_effort\n/api/v1/otlp/v1/metrics"| Prom
+
+  Grafana --> Tempo
+  Grafana --> Prom
+  Grafana -->|"SQL_dashboards\ne.g._inventory_procs"| TS
 ```
-Single demo pod
-┌──────────────────────────────────────────────┐
-│ agentd :4318                                 │──▶ TimescaleDB
-│   OTLP /v1/traces + /v1/metrics + /v1/procmetrics │
-│                                              │
-│ checkout (Java)  LD_PRELOAD ──OTLP/JSON────▶│
-│ payments (Python) LD_PRELOAD ─OTLP/JSON────▶│
-│ inventory (Go)   procwatch-wrap ─JSON──────▶│
-└──────────────────────────────────────────────┘
-         (127.0.0.1 shared netns)
-```
+
+- **Java / Python**: `LD_PRELOAD` injects OTEL bootstrap + a metric thread. Apps send OTLP traces/metrics and `/v1/procmetrics` to `agentd`.
+- **Go (static)**: `procwatch-wrap` samples the process tree and POSTs `/v1/procmetrics` only (no OTLP traces).
+- **agentd**: always writes Timescale (`<label>_spans` / `_procs` / `_otel_metrics`). When `PROCWATCH_TEMPO_ENDPOINT` / `PROCWATCH_PROMETHEUS_ENDPOINT` are set, it also best-effort forwards decoded OTLP.
+- **Grafana**: Explore Tempo (traces) and Prometheus (OTLP metrics); SQL panels against Timescale for wrap/`_procs` data (e.g. Inventory Go dashboard).
 
 Tables are keyed by each payload’s `PROCWATCH_LABEL` (also attached to OTLP as
 `procwatch.label`). `agentd` does not take `-l`; the first payload for a label
