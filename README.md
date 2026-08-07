@@ -128,7 +128,7 @@ targets.
 | --- | --- |
 | `libprocwatch_inject.so` | `LD_PRELOAD` library: runtime env bootstrap, OTEL label attachment, metric pthread (any process, not just Java/Python), execve env maintenance. |
 | `procwatch-wrap` | Parent sampler for static binaries (e.g. Go): fork/exec the app, sample `/proc/<child>`, POST the same JSON. |
-| `procwatch-agentd` | Receives OTLP/HTTP and `POST /v1/procmetrics`; creates `<label>_spans` / `<label>_procs` / `<label>_otel_metrics` on first sight. |
+| `procwatch-agentd` | Receives OTLP/HTTP and `POST /v1/procmetrics`; creates `<label>_spans` / `<label>_procs` / `<label>_otel_metrics` on first sight. Optionally dual-exports OTLP traces to Tempo and OTLP metrics to Prometheus when endpoints are configured. |
 | `java/javaagent.jar` | Upstream OpenTelemetry Java agent, loaded via `-javaagent`. |
 | `python/` | `sitecustomize.py` shim plus per-ABI vendored OpenTelemetry packages. |
 
@@ -262,6 +262,8 @@ make agent-x86_64       # agentd + glibc injector + wrap
 make agent-musl-x86_64  # musl injector + musl-static wrap (needed for Alpine Go)
 make agent              # all arches (glibc + musl)
 make world              # everything, including the original procwatch binary
+make example-up         # rebuild runtimes+agent and start examples/docker-compose.yml
+make example-down       # tear down the example compose project
 ```
 
 `procwatch-wrap` must be the musl-static build to run inside Alpine/scratch Go
@@ -277,6 +279,20 @@ the existing binary: `libpq` and its transitive dependencies are copied into
 ## Running locally
 
 ```bash
+make example-up      # fetch runtimes, rebuild agent, start the compose stack
+make example-down    # tear down the example environment
+```
+
+Grafana is at `http://localhost:3001` (admin/admin). The compose project name
+defaults to `pwdemo` (`EXAMPLE_PROJECT` / `-p`).
+
+Dashboards → **ProcWatch / ProcWatch Inventory (Go)** plots
+`procwatch.inventory_procs` from the TimescaleDB datasource (CPU / RSS /
+threads by `pid`, including wrap-sampled worker children).
+
+Manual equivalent:
+
+```bash
 make runtimes && make agent-x86_64 && make agent-musl-x86_64
 docker compose -f examples/docker-compose.yml -p pwdemo up --build
 ```
@@ -284,6 +300,13 @@ docker compose -f examples/docker-compose.yml -p pwdemo up --build
 Java/Python produce spans and inject-thread metrics into `checkout_*` /
 `payments_*`. Go uses `procwatch-wrap` and lands metrics in `inventory_procs`.
 `agentd` is started with no `-l`; tables appear on first payload.
+
+The compose stack also starts **Grafana** (`http://localhost:3001`, admin/admin),
+**Tempo**, and **Prometheus**. `agentd` dual-exports OTLP traces to Tempo and
+OTLP metrics to Prometheus via `PROCWATCH_TEMPO_ENDPOINT` /
+`PROCWATCH_PROMETHEUS_ENDPOINT` (best-effort; Timescale stays authoritative).
+Use Grafana Explore with the Tempo and Prometheus datasources. Unset those
+env vars on `agentd` to disable forwarding.
 
 Standalone:
 
@@ -299,6 +322,13 @@ procwatch-agentd -P 4318 -s procwatch -d "<conn_str>"
 | `-d` | `PROCWATCH_DB` | see `-h` | Connection string |
 | `-R` | `PROCWATCH_RETENTION_HOURS` | `168` | Timescale chunk retention (hours) |
 | `-T` | `PROCWATCH_INACTIVE_HOURS` | `720` | Drop tables with no writes for this many hours |
+| `-t` | `PROCWATCH_TEMPO_ENDPOINT` | unset | Optional Tempo OTLP/HTTP traces URL (`http://host:port/v1/traces`); best-effort forward |
+| `-m` | `PROCWATCH_PROMETHEUS_ENDPOINT` | unset | Optional Prometheus OTLP metrics URL (`http://host:port/api/v1/otlp/v1/metrics`); best-effort forward |
+
+When `-t` / `-m` (or the env vars) are set to a valid `http://` URL, agentd
+POSTs the same decoded OTLP protobuf body after writing Timescale. Forward
+failures are ignored and never change the client response; unset the vars to
+disable. HTTPS is not supported by the forwarder.
 
 ### systemd
 

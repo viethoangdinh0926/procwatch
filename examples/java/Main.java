@@ -5,6 +5,9 @@
 // It serves HTTP and also calls itself on a timer, so the OpenTelemetry
 // javaagent's servlet and HttpURLConnection instrumentation produce both
 // server and client spans without anyone driving traffic manually.
+//
+// On startup the parent also forks child `java ... Main worker` processes so
+// inject/wrap process-tree metrics cover more than a single JVM.
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -15,6 +18,8 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -26,7 +31,22 @@ public class Main {
         return Integer.parseInt(p);
     }
 
-    public static void main(String[] args) throws IOException {
+    private static int workerCount() {
+        String n = System.getenv("PROCWATCH_DEMO_WORKERS");
+        if (n == null || n.isEmpty()) return 2;
+        try {
+            return Math.max(0, Integer.parseInt(n));
+        } catch (NumberFormatException e) {
+            return 2;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0 && "worker".equals(args[0])) {
+            runWorker(args.length > 1 ? args[1] : "0");
+            return;
+        }
+
         final int PORT = port();
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
         server.createContext("/checkout", Main::handleCheckout);
@@ -35,8 +55,52 @@ public class Main {
         server.start();
         System.out.println("checkout-api listening on " + PORT);
 
+        List<Process> children = startWorkers(workerCount());
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            for (Process p : children) {
+                p.destroy();
+            }
+        }));
+
         ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor();
         timer.scheduleAtFixedRate(Main::generateTraffic, 3, 5, TimeUnit.SECONDS);
+    }
+
+    private static List<Process> startWorkers(int count) throws IOException {
+        List<Process> children = new ArrayList<>();
+        String javaHome = System.getProperty("java.home");
+        String javaBin = javaHome + "/bin/java";
+        String cp = System.getProperty("java.class.path");
+        for (int i = 0; i < count; i++) {
+            ProcessBuilder pb = new ProcessBuilder(
+                    javaBin, "-cp", cp, "Main", "worker", Integer.toString(i));
+            pb.inheritIO();
+            Process child = pb.start();
+            children.add(child);
+            System.out.println("spawned java worker-" + i + " pid=" + child.pid());
+        }
+        return children;
+    }
+
+    // Child JVM: burn a little CPU and retain a small heap so process metrics
+    // for nested java processes show up under the same PROCWATCH_LABEL.
+    private static void runWorker(String id) throws InterruptedException {
+        System.out.println("java worker-" + id + " pid=" + ProcessHandle.current().pid());
+        List<byte[]> retained = new ArrayList<>();
+        long scratch = 0;
+        while (true) {
+            long end = System.nanoTime() + 50_000_000L; // ~50ms busy
+            while (System.nanoTime() < end) {
+                scratch += System.nanoTime();
+            }
+            if (retained.size() < 8) {
+                retained.add(new byte[256 * 1024]);
+            }
+            Thread.sleep(500);
+            if (scratch == 0) {
+                System.out.println("java worker-" + id + " alive");
+            }
+        }
     }
 
     private static void handleCheckout(HttpExchange exchange) throws IOException {

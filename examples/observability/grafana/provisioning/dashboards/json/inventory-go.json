@@ -1,0 +1,151 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "description": "One series per process instance (pid key) from procwatch-wrap tree sampling into procwatch.inventory_procs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "timescaledb" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS \"time\",\n  pid::text AS metric,\n  cpu_pct AS value\nFROM procwatch.inventory_procs\nWHERE $__timeFilter(ts)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Inventory CPU % by pid",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "description": "RSS (KiB) per Go process under the inventory label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "id": 2,
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "timescaledb" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS \"time\",\n  pid::text AS metric,\n  rss_kb AS value\nFROM procwatch.inventory_procs\nWHERE $__timeFilter(ts)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Inventory RSS (KiB) by pid",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "description": "Thread count per Go process under the inventory label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "id": 3,
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "timescaledb" },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ts AS \"time\",\n  pid::text AS metric,\n  threads AS value\nFROM procwatch.inventory_procs\nWHERE $__timeFilter(ts)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Inventory threads by pid",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "description": "Recent samples from procwatch.inventory_procs (parent + workers).",
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "inspect": false } },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 18 },
+      "id": 4,
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "timescaledb" },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts, pid, comm, runtime, round(cpu_pct::numeric, 2) AS cpu_pct, rss_kb, threads\nFROM procwatch.inventory_procs\nWHERE $__timeFilter(ts)\nORDER BY ts DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "Inventory recent process samples",
+      "type": "table"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["procwatch", "inventory", "go"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ProcWatch Inventory (Go)",
+  "uid": "procwatch-inventory-go",
+  "version": 1
+}

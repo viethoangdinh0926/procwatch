@@ -1,14 +1,26 @@
-# Local end-to-end stack: TimescaleDB, procwatch-agentd, and one workload per
-# supported runtime. Verifies the whole path without a Kubernetes cluster.
+# Local end-to-end stack: TimescaleDB, procwatch-agentd, demo apps, and
+# Grafana + Tempo + Prometheus for Explore (traces / OTLP metrics).
 #
-# Prerequisites:
+# Prerequisites / lifecycle:
+#   make example-up      # rebuild runtimes+agent, then up --build
+#   make example-down    # tear down the compose project
+#
+# Manual equivalent:
 #   make runtimes && make agent-x86_64 && make agent-musl-x86_64
-#
-# Then:
-#   docker-compose -f examples/docker-compose.yml -p pwdemo up --build
+#   docker compose -f examples/docker-compose.yml -p pwdemo up --build
 #
 # Java/Python produce spans and inject-thread metrics into
-# <label>_spans / <label>_procs. Go uses procwatch-wrap for metrics only.
+# <label>_spans / <label>_procs (and OTLP SDK metrics into <label>_otel_metrics).
+# Go uses procwatch-wrap for metrics only.
+#
+# agentd dual-exports decoded OTLP traces → Tempo and OTLP metrics → Prometheus
+# when PROCWATCH_TEMPO_ENDPOINT / PROCWATCH_PROMETHEUS_ENDPOINT are set (best-effort;
+# Timescale remains authoritative). Unset those env vars to disable forwarding.
+#
+# Grafana: http://localhost:3001  (admin / admin; host 3000 often taken)
+# Provisioned Grafana datasources/dashboards are editable in the UI.
+# Tempo/Prometheus/Grafana config bind-mounts are writable (edit under
+# examples/observability/ then recreate/reload the service).
 
 version: "2.4"
 
@@ -27,6 +39,45 @@ services:
       timeout: 3s
       retries: 20
 
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml
+    ports:
+      - "3200:3200"
+      - "4319:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-otlp-receiver
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    depends_on:
+      - tempo
+      - prometheus
+      - timescaledb
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_USERS_DEFAULT_THEME: light
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+
   agentd:
     build:
       context: ..
@@ -34,9 +85,15 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
+      tempo:
+        condition: service_started
+      prometheus:
+        condition: service_started
     environment:
       PROCWATCH_DB: "postgresql://procwatcher:procwatcherpw@timescaledb:5432/procwatcherdb"
       PROCWATCH_SCHEMA: procwatch
+      PROCWATCH_TEMPO_ENDPOINT: http://tempo:4318/v1/traces
+      PROCWATCH_PROMETHEUS_ENDPOINT: http://prometheus:9090/api/v1/otlp/v1/metrics
     ports:
       - "4318:4318"
 
@@ -57,7 +114,7 @@ services:
       PROCWATCH_LABEL: checkout
       PROCWATCH_METRIC_INTERVAL: "5"
       PROCWATCH_INJECT_DEBUG: "1"
-      OTEL_SERVICE_NAME: checkout-api
+      OTEL_SERVICE_NAME: checkout
       OTEL_BSP_SCHEDULE_DELAY: "2000"
       OTEL_METRIC_EXPORT_INTERVAL: "5000"
 

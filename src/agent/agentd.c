@@ -22,6 +22,7 @@
 #include "../../include/db_buffer.h"
 #include "../../include/agent/http_server.h"
 #include "../../include/agent/otlp.h"
+#include "../../include/agent/otlp_forward.h"
 #include "../../include/agent/db_otlp.h"
 
 static const char *DEFAULT_CONNINFO =
@@ -38,6 +39,11 @@ static void on_signal(int sig) {
 typedef struct {
     pw_db_buf_t dbbuf;
     char schema[100];
+    // Optional dual-export targets (NULL / invalid => disabled).
+    const char *tempo_endpoint;
+    const char *prometheus_endpoint;
+    int tempo_fwd_warned;
+    int prometheus_fwd_warned;
     unsigned long long spans_written;
     unsigned long long spans_dropped;
     unsigned long long spans_spilled;
@@ -51,6 +57,17 @@ typedef struct {
     unsigned long long payloads_procmetrics;
     unsigned long long payloads_other;
 } agent_state_t;
+
+// Best-effort forward; never affects the caller's return / HTTP status.
+static void maybe_forward(const char *url, int *warned,
+                          const char *label, const uint8_t *body, size_t len) {
+    if (!url || !otlp_forward_url_valid(url)) return;
+    if (otlp_forward_post(url, body, len) == 0) return;
+    if (*warned) return;
+    *warned = 1;
+    fprintf(stderr, "procwatch-agentd: %s forward failed (further errors suppressed)\n",
+            label);
+}
 
 static PGconn *st_conn(agent_state_t *st) { return st->dbbuf.conn; }
 
@@ -283,6 +300,8 @@ static int on_request(const pw_http_request_t *req, void *user_data) {
             fprintf(stderr, "malformed OTLP metrics payload (%zu bytes)\n", req->body_len);
             return -1;
         }
+        maybe_forward(st->prometheus_endpoint, &st->prometheus_fwd_warned,
+                      "Prometheus", req->body, req->body_len);
         return 0;
     }
 
@@ -297,6 +316,8 @@ static int on_request(const pw_http_request_t *req, void *user_data) {
         fprintf(stderr, "malformed OTLP trace payload (%zu bytes)\n", req->body_len);
         return -1;
     }
+    maybe_forward(st->tempo_endpoint, &st->tempo_fwd_warned,
+                  "Tempo", req->body, req->body_len);
     return 0;
 }
 
@@ -402,13 +423,17 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [-b bind_addr] [-P port]\n"
         "          [-d conn_str] [-s schema] [-R retention_hours] [-T inactive_hours]\n"
-        "          [-h]\n"
+        "          [-t tempo_url] [-m prometheus_url] [-h]\n"
         "  -b <addr>     Listen address (default 0.0.0.0, env PROCWATCH_BIND)\n"
         "  -P <port>     OTLP/HTTP port (default 4318, env PROCWATCH_PORT)\n"
         "  -d <conn>     PostgreSQL connection string (env PROCWATCH_DB)\n"
         "  -s <schema>   Schema (default procwatch, env PROCWATCH_SCHEMA)\n"
         "  -R <hours>    Timescale chunk retention (default %d, env PROCWATCH_RETENTION_HOURS)\n"
         "  -T <hours>    Drop tables idle longer than this (default %d, env PROCWATCH_INACTIVE_HOURS)\n"
+        "  -t <url>      Optional Tempo OTLP/HTTP traces URL (env PROCWATCH_TEMPO_ENDPOINT)\n"
+        "                e.g. http://tempo:4318/v1/traces — best-effort forward; failures ignored\n"
+        "  -m <url>      Optional Prometheus OTLP metrics URL (env PROCWATCH_PROMETHEUS_ENDPOINT)\n"
+        "                e.g. http://prometheus:9090/api/v1/otlp/v1/metrics — best-effort\n"
         "\n"
         "Tables are named <label>_spans / <label>_procs / <label>_otel_metrics from\n"
         "each payload's PROCWATCH_LABEL / procwatch.label; no -l flag is required.\n"
@@ -416,7 +441,9 @@ static void usage(const char *argv0) {
         "OTLP metrics (POST /v1/metrics) from the Java/Python SDKs land in\n"
         "<label>_otel_metrics, one row per data point.\n"
         "If the database is unreachable, data is spilled under PROCWATCH_SPILL_DIR\n"
-        "(default /var/tmp/procwatch) and flushed on reconnect.\n",
+        "(default /var/tmp/procwatch) and flushed on reconnect.\n"
+        "When -t/-m (or env) URLs are set to valid http:// endpoints, decoded OTLP\n"
+        "trace/metric payloads are also forwarded; Timescale remains authoritative.\n",
         argv0, PW_DEFAULT_RETENTION_HOURS, PW_DEFAULT_INACTIVE_HOURS);
 }
 
@@ -436,12 +463,14 @@ int main(int argc, char **argv) {
     const char *bind_addr = env_or("PROCWATCH_BIND", "0.0.0.0");
     const char *conninfo = env_or("PROCWATCH_DB", DEFAULT_CONNINFO);
     const char *schema = env_or("PROCWATCH_SCHEMA", DEFAULT_SCHEMA);
+    const char *tempo_endpoint = getenv("PROCWATCH_TEMPO_ENDPOINT");
+    const char *prometheus_endpoint = getenv("PROCWATCH_PROMETHEUS_ENDPOINT");
     int port = env_int("PROCWATCH_PORT", 4318);
     int retention_hours = env_int("PROCWATCH_RETENTION_HOURS", PW_DEFAULT_RETENTION_HOURS);
     int inactive_hours = env_int("PROCWATCH_INACTIVE_HOURS", PW_DEFAULT_INACTIVE_HOURS);
 
     int opt;
-    while ((opt = getopt(argc, argv, "b:P:d:s:R:T:h")) != -1) {
+    while ((opt = getopt(argc, argv, "b:P:d:s:R:T:t:m:h")) != -1) {
         switch (opt) {
             case 'b': bind_addr = optarg; break;
             case 'P': port = atoi(optarg); break;
@@ -449,6 +478,8 @@ int main(int argc, char **argv) {
             case 's': schema = optarg; break;
             case 'R': retention_hours = atoi(optarg); break;
             case 'T': inactive_hours = atoi(optarg); break;
+            case 't': tempo_endpoint = optarg; break;
+            case 'm': prometheus_endpoint = optarg; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
@@ -468,6 +499,18 @@ int main(int argc, char **argv) {
     }
     db_set_housekeeping(retention_hours, inactive_hours);
 
+    // Empty or non-http URLs disable forwarding (no hard fail).
+    if (tempo_endpoint && !otlp_forward_url_valid(tempo_endpoint)) {
+        fprintf(stderr, "procwatch-agentd: ignoring invalid Tempo endpoint (need http://host[:port]/path])\n");
+        tempo_endpoint = NULL;
+    }
+    if (prometheus_endpoint && !otlp_forward_url_valid(prometheus_endpoint)) {
+        fprintf(stderr, "procwatch-agentd: ignoring invalid Prometheus endpoint (need http://host[:port]/path])\n");
+        prometheus_endpoint = NULL;
+    }
+    if (tempo_endpoint && !*tempo_endpoint) tempo_endpoint = NULL;
+    if (prometheus_endpoint && !*prometheus_endpoint) prometheus_endpoint = NULL;
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -475,6 +518,8 @@ int main(int argc, char **argv) {
     agent_state_t state;
     memset(&state, 0, sizeof state);
     snprintf(state.schema, sizeof state.schema, "%s", schema);
+    state.tempo_endpoint = tempo_endpoint;
+    state.prometheus_endpoint = prometheus_endpoint;
     pw_db_buf_init(&state.dbbuf, conninfo, NULL, "agentd.ndjson");
 
     if (state.dbbuf.online) {
@@ -495,6 +540,11 @@ int main(int argc, char **argv) {
            state.dbbuf.online ? "" : " [offline spill]");
     printf("procwatch-agentd: retention=%dh inactive=%dh\n",
            db_retention_hours(), db_inactive_hours());
+    if (state.tempo_endpoint)
+        printf("procwatch-agentd: Tempo forward %s (best-effort)\n", state.tempo_endpoint);
+    if (state.prometheus_endpoint)
+        printf("procwatch-agentd: Prometheus forward %s (best-effort)\n",
+               state.prometheus_endpoint);
     fflush(stdout);
 
     time_t next_maintain = time(NULL) + 1;

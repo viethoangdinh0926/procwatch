@@ -1,0 +1,36 @@
+# Minimal single-binary Tempo for the procwatch demo compose stack.
+# Receives OTLP/HTTP from agentd dual-export on :4318.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /tmp/tempo/wal
+    local:
+      path: /tmp/tempo/blocks
+
+querier: {}
+
+query_frontend: {}
+
+overrides:
+  defaults: {}

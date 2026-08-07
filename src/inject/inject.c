@@ -144,13 +144,15 @@ static void set_resource_attr(const char *key, const char *value) {
 // the same "<pid>_<start stamp>" series key convention used for the pid
 // column in <label>_procs, so OTLP metrics in <label>_otel_metrics can be
 // correlated back to a specific process instance rather than just a pid
-// that may have been reused.
+// that may have been reused. Also sets service.instance.id to the same
+// value so Prometheus's `instance` label keeps parent/child series distinct.
 static void pw_attach_pid_key_to_otel(void) {
     char stamp[32];
     pw_format_created_stamp(stamp, sizeof stamp, time(NULL));
     char pid_key[64];
     snprintf(pid_key, sizeof pid_key, "%d%s", (int)getpid(), stamp);
     set_resource_attr("procwatch.pid_key", pid_key);
+    set_resource_attr("service.instance.id", pid_key);
 }
 
 static int path_exists(const char *path) {

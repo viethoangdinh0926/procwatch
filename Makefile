@@ -22,7 +22,8 @@ AGENT_RUNTIME_DIR := $(BUILD_DIR)/agent-runtime
 
 .PHONY: all x86_64 aarch64 clean \
         agent agent-x86_64 agent-aarch64 agent-musl-x86_64 agent-musl-aarch64 \
-        runtimes world clean-agent clean-all
+        runtimes world clean-agent clean-all \
+        example-up example-down
 
 all: x86_64 aarch64
 
@@ -90,3 +91,23 @@ clean-agent:
 
 clean-all: clean clean-agent
 	rm -rf $(AGENT_RUNTIME_DIR)
+
+# ------------------------ Local example stack ------------------------
+#
+# Rebuilds runtimes + agent bundles, then brings up
+# examples/docker-compose.yml (Timescale, agentd, apps, Grafana/Tempo/Prometheus).
+# Prefer Compose V2 (`docker compose`); override if needed:
+#   make example-up DOCKER_COMPOSE=docker-compose
+
+DOCKER_COMPOSE ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo docker-compose)
+EXAMPLE_PROJECT ?= pwdemo
+EXAMPLE_COMPOSE_FILE := examples/docker-compose.yml
+
+example-up: runtimes agent-x86_64 agent-musl-x86_64
+	$(DOCKER_COMPOSE) -f $(EXAMPLE_COMPOSE_FILE) -p $(EXAMPLE_PROJECT) down --remove-orphans || true
+	$(DOCKER_COMPOSE) -f $(EXAMPLE_COMPOSE_FILE) -p $(EXAMPLE_PROJECT) up --build -d
+	@echo "Example stack up (-p $(EXAMPLE_PROJECT)). Grafana: http://localhost:3001 (admin/admin)"
+
+example-down:
+	$(DOCKER_COMPOSE) -f $(EXAMPLE_COMPOSE_FILE) -p $(EXAMPLE_PROJECT) down --remove-orphans
+	@echo "Example stack (-p $(EXAMPLE_PROJECT)) torn down."

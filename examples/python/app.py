@@ -8,10 +8,15 @@ Flask rather than http.server because the stdlib HTTP server has no
 OpenTelemetry instrumentation, so it would produce no server spans and make
 a working injection look broken. The app also calls itself on a timer, which
 the urllib instrumentation turns into client spans.
+
+On startup the parent also spawns child `python ... --worker` processes so
+inject process-tree metrics cover nested interpreters under the same label.
 """
 
 import os
 import random
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -19,6 +24,44 @@ import urllib.request
 from flask import Flask, jsonify
 
 PORT = int(os.environ.get("PORT", "8080"))
+
+
+def worker_count():
+    raw = os.environ.get("PROCWATCH_DEMO_WORKERS", "2")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2
+
+
+def run_worker(worker_id):
+    """Child interpreter: light CPU + retained memory for process metrics."""
+    print("python worker-%s pid=%d" % (worker_id, os.getpid()), flush=True)
+    retained = []
+    scratch = 0
+    while True:
+        end = time.time() + 0.05
+        while time.time() < end:
+            scratch += 1
+        if len(retained) < 8:
+            retained.append(bytearray(256 * 1024))
+        time.sleep(0.5)
+        if scratch == 0:
+            print("python worker-%s alive" % worker_id, flush=True)
+
+
+def start_workers(count):
+    children = []
+    for i in range(count):
+        child = subprocess.Popen(
+            [sys.executable, __file__, "--worker", str(i)],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        children.append(child)
+        print("spawned python worker-%d pid=%d" % (i, child.pid), flush=True)
+    return children
+
 
 app = Flask(__name__)
 
@@ -51,7 +94,18 @@ def generate_traffic():
 
 
 if __name__ == "__main__":
+    if "--worker" in sys.argv:
+        idx = sys.argv.index("--worker")
+        wid = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "0"
+        run_worker(wid)
+        raise SystemExit(0)
+
+    children = start_workers(worker_count())
     threading.Thread(target=generate_traffic, daemon=True).start()
     print("payments listening on %d" % PORT, flush=True)
-    # The reloader would fork a second interpreter and double the spans.
-    app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
+    try:
+        # The reloader would fork a second interpreter and double the spans.
+        app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
+    finally:
+        for child in children:
+            child.terminate()

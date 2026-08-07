@@ -22,6 +22,7 @@ AGENT_SRCS=(
     src/agent/otlp_common.c
     src/agent/otlp_trace.c
     src/agent/otlp_metric.c
+    src/agent/otlp_forward.c
     src/agent/db_otlp.c
     src/util.c
     src/db.c

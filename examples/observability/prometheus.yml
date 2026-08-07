@@ -1,0 +1,21 @@
+# Prometheus for the procwatch demo. OTLP receiver is enabled via the
+# container command (--web.enable-otlp-receiver). Agentd POSTs to
+# /api/v1/otlp/v1/metrics. No scrape jobs — avoids flooding Explore with
+# Prometheus's own Go runtime metrics.
+#
+# Promote procwatch.* (and service.instance.id) so parent vs child processes
+# under the same service.name appear as distinct series/lines in Grafana.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+otlp:
+  keep_identifying_resource_attributes: true
+  promote_resource_attributes:
+    - service.instance.id
+    - service.name
+    - procwatch.label
+    - procwatch.pid_key
+
+scrape_configs: []
